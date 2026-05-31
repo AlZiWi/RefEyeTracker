@@ -47,4 +47,3 @@ For Recording and Calibration, choose the appropriate presets.
         4. Calibrate LED positions and scene camera position using 2.1.1 and the calibration results from 3.1.1 [optional bundle adjustment]
         4. Calibrate LED positions (and scene camera position) using 2.1.2 and the calibration results from 3.1.2 [optional bundle adjustment]
     5. Calibrate scene camera extrinsic parameters using 2.1.1, (2.1.2), and 2.2 [optional bundle adjustment] [option to include 2.1.2 only if scene camera position is labeled in 2.1.2, otherwise only use 2.1.1]
-    6. (Optional) Refine all calibration results using bundle adjustment with all images and all labeled points as input... if that works.
