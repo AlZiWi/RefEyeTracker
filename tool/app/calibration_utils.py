@@ -18,7 +18,7 @@ class Logger:
             self.print_func(f"[{level.upper()}] {msg}")
 
 
-def lsq_intersection_of_lines(point_vecs, normal_vecs):
+def lsq_intersection_of_lines(point_vecs, normal_vecs, verbose=False):
     # TODO idea: use weighted sum depending on ellipse fit quality etc.?
     
     vec_len = len(point_vecs[0])
@@ -49,9 +49,15 @@ def lsq_intersection_of_lines(point_vecs, normal_vecs):
         nv = unit_vector(nv)
         
         dsts.append(np.linalg.norm(np.cross(nv.A1, pv.A1 - c_proj.A1)))
-        
-    print(f"[dbg] dsts: {dsts}")
+    
     projection_error = np.sum(np.array(dsts))
+    
+    if verbose:
+        print(f"[dbg] point_vecs: {point_vecs}")
+        print(f"[dbg] normal_vecs: {normal_vecs}")
+        print(f"[dbg] c_proj: {c_proj.A1}")
+        print(f"[dbg] dsts: {dsts}")
+        print(f"[dbg] projection_error: {projection_error}")
     
     return c_proj.A1, projection_error
 
@@ -95,10 +101,12 @@ def calculate_pairwise_camera_calib_vecs(calib_data, calib_data_offset=None):
 
     cam_pair_calib[0]["relative"] = {'origin': cam_origin,
                 'z': cam_z_origin,
-                'y': cam_y_origin}
+                'y': cam_y_origin,
+                'T': np.matrix(np.eye(4))}
     cam_pair_calib[1]["relative"] = {'origin': T * cam_origin,
                 'z': R * cam_z_origin,
-                'y': R * cam_y_origin}
+                'y': R * cam_y_origin,
+                'T': T}
         
     if calib_data_offset is not None:
         T_offset = transformation_matrix_from_calib_ext(calib_data_offset["camera_params_1"].extrinsic)
@@ -106,10 +114,12 @@ def calculate_pairwise_camera_calib_vecs(calib_data, calib_data_offset=None):
         
         cam_pair_calib[0]["absolute"] = {'origin': T_offset * cam_origin,
                 'z': R_offset * cam_z_origin,
-                'y': R_offset * cam_y_origin}
+                'y': R_offset * cam_y_origin,
+                'T': T_offset}
         cam_pair_calib[1]["absolute"] = {'origin': T_offset * T * cam_origin,
             'z': R_offset * R * cam_z_origin,
-            'y': R_offset * R * cam_y_origin}
+            'y': R_offset * R * cam_y_origin,
+            'T': T_offset * T}
     else:
         cam_pair_calib[0]["absolute"] = cam_pair_calib[0]["relative"]
         cam_pair_calib[1]["absolute"] = cam_pair_calib[1]["relative"]
@@ -137,6 +147,76 @@ def rotation_matrix_from_vectors(vec1, vec2):
 def unit_vector(vector):
     """ Returns the unit vector of the vector. """
     return vector / np.linalg.norm(vector)
+
+
+def find_vector_by_angles(a, b, angle_a, angle_b):
+    """
+    Finds a 3D unit vector that forms angle_a with vector 'a' 
+    and angle_b with vector 'b'.
+    Angles must be provided in radians.
+    """
+    # 1. Normalize reference vectors
+    a_u = a / np.linalg.norm(a)
+    b_u = b / np.linalg.norm(b)
+    
+    # 2. Build an orthonormal basis (Gram-Schmidt)
+    u1 = a_u
+    
+    # Check if a and b are collinear
+    dot_ab = np.dot(u1, b_u)
+    if np.abs(dot_ab) > 0.999999:
+        raise ValueError("Reference vectors are collinear; infinite solutions or no solution.")
+        
+    # Second basis vector in the plane of a and b
+    u2 = b_u - dot_ab * u1
+    u2 = u2 / np.linalg.norm(u2)
+    
+    # Third basis vector perpendicular to the plane
+    u3 = np.cross(u1, u2)
+    
+    # 3. Solve for coordinates in the new basis (x', y', z')
+    # Equation 1: v_prime[0] = cos(angle_a)
+    x_prime = np.cos(angle_a)
+    
+    # Equation 2: v . b_u = cos(angle_b)
+    # Expressing b_u in the new basis: b_u = dot_ab * u1 + sin_ab * u2
+    # Where sin_ab = sqrt(1 - dot_ab^2)
+    sin_ab = np.sqrt(1 - dot_ab**2)
+    y_prime = (np.cos(angle_b) - x_prime * dot_ab) / sin_ab
+    
+    # Equation 3: Unit length condition -> x'^2 + y'^2 + z'^2 = 1
+    z_prime_sq = 1.0 - x_prime**2 - y_prime**2
+    
+    #print(f"Finding vector by angles: angle_a={np.rad2deg(angle_a)}, angle_b={np.rad2deg(angle_b)}, x'={x_prime}, y'={y_prime}, z'^2={z_prime_sq}")
+    if z_prime_sq < -1e-7:
+        #raise ValueError("No solution exists for these angles with the given vectors. (sum of both angles > angle between a and b)")
+        # Patch: Reduce angles slightly to find a solution. Ideally this should not happen and if it does, it indicates that some aspects of the calibration are off.
+        angle_a = max(0, angle_a - .01)
+        angle_b = max(0, angle_b - .01)
+        return find_vector_by_angles(a, b, angle_a, angle_b)
+    elif np.abs(z_prime_sq) < 1e-7:
+        # One unique solution (the vector lies exactly in the plane of a and b)
+        z_prime_possibilities = [0.0]
+    else:
+        # Two solutions (mirrored across the plane of a and b)
+        z_prime = np.sqrt(z_prime_sq)
+        z_prime_possibilities = [z_prime, -z_prime]
+        
+    # 4. Transform coordinates back to the global system
+    solutions = []
+    for z_p in z_prime_possibilities:
+        v = x_prime * u1 + y_prime * u2 + z_p * u3
+        solutions.append(v)
+        
+    return solutions
+
+
+def angle_between_vectors(v1, v2):
+    v1_u = v1 / np.linalg.norm(v1)
+    v2_u = v2 / np.linalg.norm(v2)
+    dot_product = np.clip(np.dot(v1_u, v2_u), -1.0, 1.0)
+    angle = np.arccos(dot_product)
+    return angle
 
 
 def undistort_points(points, K, dist):
