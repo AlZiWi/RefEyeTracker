@@ -182,12 +182,12 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
 
     vtimer = VTimer()
 
-    cap = cv2.VideoCapture(serial_idx)
+    cap = cv2.VideoCapture(serial_idx, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-    width = 600
-    height = 400
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    #width = 600
+    #height = 400
+    #cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    #cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, 60)
     
     frame_idx = 0
