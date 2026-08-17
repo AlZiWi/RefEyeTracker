@@ -180,14 +180,14 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
     
     metadata = []
 
-    vtimer = VTimer()
+    vtimer = None
 
-    cap = cv2.VideoCapture(serial_idx, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(serial_idx, cv2.CAP_MSMF)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-    #width = 600
-    #height = 400
-    #cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    #cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    width = 240
+    height = 240
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, 60)
     
     frame_idx = 0
@@ -202,11 +202,16 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
         if not ret:
             if camera_handler.debug:
                 print(f"Failed to read frame from USB camera {serial_idx}.")
-            break
+            continue  # Skip this iteration if frame read fails, can happen if camera is externally triggered and times out due to lack of trigger signals.
+        else:
+            if vtimer is None:
+                vtimer = VTimer()
 
         vtimer.time_log(frame_idx)
 
         x_timestamp = vtimer.get()["times"][-1] - vtimer.get()["times"][0]  # relative timestamp from start
+        x_timestamp_hw = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        x_frame_idx_hw = cap.get(cv2.CAP_PROP_POS_MSEC)
         metadata.append({
             "frame_idx": frame_idx,
             "x_timestamp": x_timestamp,

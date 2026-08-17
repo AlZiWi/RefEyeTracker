@@ -26,7 +26,7 @@ import websockets
 
 import pickle
 
-from eye_crop_and_glint import *
+#from eye_crop_and_glint import *
 
 
 
@@ -75,9 +75,21 @@ class App:
         
         
         self.capture_calibration_presets = {
-            "capture_preset_order": ["CAPTURE", "Stereo R-R", "Stereo L-L", "Stereo R-L", "Mono SC", "Mirror R", "Mirror L", "Mirror SC"],
+            "capture_preset_order": ["CAM_TEST", "CAPTURE", "Stereo R-R", "Stereo L-L", "Stereo R-L", "Mono SC", "Mirror R", "Mirror L", "Mirror SC"],
             "calib_preset_order": ["Stereo R-R", "Stereo R-L", "Stereo L-L", "Mono SC", "Mirror R", "Mirror L", "Mirror SC", "Full Calibration"],
             "presets": {
+                "CAM_TEST": {
+                    "description": "Mode for testing a single camera",
+                    "camera_indices": ["ro"],
+                    "folder_path": "recording",
+                    "use_pattern": None,
+                    "capture_settings": {
+                        "use_threshold": False,
+                        "auto_accept": False,
+                        "auto_contrast": False,
+                    },
+                    "calib_settings": None
+                },
                 "CAPTURE": {
                     "description": "Default capture mode",
                     "camera_indices": ["ro", "ri", "lo", "li", "sc"],
@@ -210,46 +222,40 @@ class App:
             }
         }
         
-        url_cams_ROUTER = ['http://192.168.178.20', 'http://192.168.178.21', 'http://192.168.178.22', 'http://192.168.178.23', 0]  # IP camera URLs and USB camera index (Find camera index via ffmpeg -f avfoundation -list_devices true -i "")
-        url_cams_MAC = ['http://192.168.2.8', 'http://192.168.2.9', 'http://192.168.2.6', 'http://192.168.2.7', 0]
-        
-        adapter_ip_ROUTER = "192.168.178.57"  # Ethernet adapter IP address
-        adapter_ip_SILVER = "192.168.178.28"
-        adapter_ip_MAC = "10.162.127.98"
-
-        default_adapter_ip = adapter_ip_ROUTER
-        default_url_cams = url_cams_ROUTER
-        
         available_types_cams = ['IP', 'USB']
+        
+        default_url_cams = [1, 2, 3, 4, 0]  # IP camera URLs and USB camera index (Find camera index via ffmpeg -f avfoundation -list_devices true -i "")
+        default_adapter_ip = ""#"192.168.178.57"  # Ethernet adapter IP address
+        default_types_cams = ['USB', 'USB', 'USB', 'USB', 'USB']
         
         self.camera_settings = {
             "ro": {
                 "url": default_url_cams[0],
-                "type": 'IP',
+                "type": default_types_cams[0],
                 "grid_placement": [0,0],  # col, row positions of visualization frames for each camera
                 "eye_cam": True
             },
             "ri": {
                 "url": default_url_cams[1],
-                "type": 'IP',
+                "type": default_types_cams[1],
                 "grid_placement": [1,0],
                 "eye_cam": True
             },
             "lo": {
                 "url": default_url_cams[3],
-                "type": 'IP',
+                "type": default_types_cams[3],
                 "grid_placement": [0,1],
                 "eye_cam": True
             },
             "li": {
                 "url": default_url_cams[2],
-                "type": 'IP',
+                "type": default_types_cams[2],
                 "grid_placement": [1,1],
                 "eye_cam": True
             },
             "sc": {
                 "url": default_url_cams[4],
-                "type": 'USB',
+                "type": default_types_cams[4],
                 "grid_placement": [0,2],
                 "eye_cam": False
             }
@@ -3250,7 +3256,8 @@ class App:
                 imgdata = cv2.cvtColor(imgdata, cv2.COLOR_GRAY2RGB)
             for idx, corner in enumerate(corners):
                 color = (0, 255, 0) if idx < 2 else (255, 0, 0)
-                imgdata = cv2.circle(imgdata, (int(corner[0][0]), int(corner[0][1])), 3, color, -1)
+                if corner is not None and type(corner) is np.ndarray and corner.shape[0] > 0 and type(corner[0]) is np.ndarray and corner[0].shape[0] >= 2:
+                    imgdata = cv2.circle(imgdata, (int(corner[0][0]), int(corner[0][1])), 3, color, -1)
         else:
             #print("No corners detected.")
             imgdata = frame.copy()
