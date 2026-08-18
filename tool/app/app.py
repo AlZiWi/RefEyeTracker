@@ -798,7 +798,7 @@ class App:
                 if frame_idx != float('inf'):
                     img_names_aligned_by_frame_idx[frame_idx] = {"filename": img_name, "timestamp": frame_timestamp}
                     # Create bins matching framerate of 44.5fps (~22.47ms per frame)
-                    base_framerate = 44.5
+                    base_framerate = 44.5  # TODO
                     bin_idx = int((frame_timestamp + .5*(1/base_framerate)) // (1/base_framerate))
                     if bin_idx not in img_names_aligned_by_timestamp.keys():
                         img_names_aligned_by_timestamp[bin_idx] = {"filename": img_name, "frame_idx": frame_idx}  # IF support for multiple images per bin is needed, change to list
@@ -3094,11 +3094,6 @@ class App:
                     cam_frame["img_store"] = None
                     cam_frame["img_store_raw"] = None
                     cam_frame["metadata_store"] = None
-
-            self.camera_handler = CameraHandler(
-                urls=self.curr_capture_cam_urls,
-                adapter_ip=self.sv_adapter_ip.get()
-            )
             
             if mode == "capture":
                 stream_enabled = self.sv_capture_with_stream.get() == 'active'
@@ -3117,6 +3112,13 @@ class App:
                 recording_enabled = False
                 self.sv_btn_start_stream.set("Stop Stream")
                 print("Stream activated")
+            
+            self.camera_handler = CameraHandler(
+                urls=self.curr_capture_cam_urls,
+                capture_folder_path=self.curr_capture_folder_path,
+                capture_cam_labels=self.curr_capture_cam_labels,
+                adapter_ip=self.sv_adapter_ip.get(),
+            )
                 
             if self.sv_sync_recording_with_stimulus.get() == 'active':
                 print("Syncing capture with stimulus...")
@@ -3155,15 +3157,15 @@ class App:
                 self.sv_recording.set("Start Capture")
                 
                 # Empty queues and gather remaining frames for saving
-                for stream_idx, cam_label in enumerate(self.curr_capture_cam_labels):
-                    print(f"Gathering remaining frames for camera {cam_label} from stream index {stream_idx} queue...")
-                    while True:
-                        try:
-                            frame_q_data = self.camera_handler.recording_qs[stream_idx].get_nowait()
-                            self.save_frame(frame_q_data["frame"], frame_q_data["metadata"][-1]["frame_idx"], frame_q_data["metadata"][-1]["x_timestamp_from_start"], cam_label)
-                        except queue.Empty:
-                            print(f"No more frames in queue for camera {cam_label}.")
-                            break
+                #for stream_idx, cam_label in enumerate(self.curr_capture_cam_labels):
+                #    print(f"Gathering remaining frames for camera {cam_label} from stream index {stream_idx} queue...")
+                #    while True:
+                #        try:
+                #            frame_q_data = self.camera_handler.recording_qs[stream_idx].get_nowait()
+                #            self.save_frame(frame_q_data["frame"], frame_q_data["metadata"][-1]["frame_idx"], frame_q_data["metadata"][-1]["x_timestamp_from_start"], cam_label)
+                #        except queue.Empty:
+                #            print(f"No more frames in queue for camera {cam_label}.")
+                #            break
 
                 logs={
                     "url_cams": self.curr_capture_cam_urls,
@@ -3266,6 +3268,7 @@ class App:
 
     
     def update_stream_ui(self):
+        
         if self.capture_state != "inactive":
             capture_info = {
                 cam_label: {
@@ -3286,10 +3289,10 @@ class App:
                     self.vtimer.time_log()
                     
                     self.cam_frames[cam_label]["metadata_store"] = {
-                        "x_timestamp": stream_entry["metadata"][-1]["x_timestamp"],
-                        "x_timestamp_from_start": stream_entry["metadata"][-1]["x_timestamp_from_start"],
-                        "frame_idx": stream_entry["metadata"][-1]["frame_idx"],
-                        "fps": stream_entry['fps']
+                       "x_timestamp": stream_entry["metadata"]["x_timestamp"],
+                       "x_timestamp_from_start": stream_entry["metadata"]["x_timestamp_from_start"],
+                       "frame_idx": stream_entry["metadata"]["frame_idx"],
+                       "fps": stream_entry['fps']
                     }
 
                     capture_info[cam_label]["frame"] = stream_entry["frame"]
@@ -3388,13 +3391,13 @@ class App:
                 print("WebSocket requested termination, stopping capture/stream.")
                 self.toggle_capture(self.capture_state)
         
-        if self.capture_state == "capture":
-            for stream_idx, _ in enumerate(self.curr_capture_cam_labels):
-                try:
-                    frame_q_data = self.camera_handler.recording_qs[stream_idx].get_nowait()
-                    self.save_frame(frame_q_data["frame"], frame_q_data["metadata"][-1]["frame_idx"], frame_q_data["metadata"][-1]["x_timestamp_from_start"], self.curr_capture_cam_labels[stream_idx])
-                except queue.Empty:
-                    break
+        # if self.capture_state == "capture":
+        #     for stream_idx, _ in enumerate(self.curr_capture_cam_labels):
+        #         try:
+        #             frame_q_data = self.camera_handler.recording_qs[stream_idx].get_nowait()
+        #             self.save_frame(frame_q_data["frame"], frame_q_data["metadata"][-1]["frame_idx"], frame_q_data["metadata"][-1]["x_timestamp_from_start"], self.curr_capture_cam_labels[stream_idx])
+        #         except queue.Empty:
+        #             break
 
     def on_closing(self):
         self.root.destroy()

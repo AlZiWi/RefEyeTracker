@@ -180,9 +180,13 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
     
     metadata = []
 
-    vtimer = None
+    # vtimer = None
 
-    cap = cv2.VideoCapture(serial_idx, cv2.CAP_MSMF)
+    # ring buffer for fps -> 60FPS baseline
+    fps_buffer = np.zeros(50)
+    start_time = 0
+
+    cap = cv2.VideoCapture(serial_idx)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
     width = 240
     height = 240
@@ -203,15 +207,16 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
             if camera_handler.debug:
                 print(f"Failed to read frame from USB camera {serial_idx}.")
             continue  # Skip this iteration if frame read fails, can happen if camera is externally triggered and times out due to lack of trigger signals.
-        else:
-            if vtimer is None:
-                vtimer = VTimer()
 
-        vtimer.time_log(frame_idx)
+        if start_time == 0:
+            start_time = time.perf_counter()
 
-        x_timestamp = vtimer.get()["times"][-1] - vtimer.get()["times"][0]  # relative timestamp from start
-        x_timestamp_hw = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        x_frame_idx_hw = cap.get(cv2.CAP_PROP_POS_MSEC)
+        fps_buffer[frame_idx % 50] = time.perf_counter()
+        fps = 1.0 / (fps_buffer[(frame_idx) % 50] - fps_buffer[(frame_idx + 1) % 50]) * (50.0 - 1)
+
+        x_timestamp = fps_buffer[frame_idx % 50] - start_time  # relative timestamp from start
+        #x_timestamp_hw = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        #x_frame_idx_hw = cap.get(cv2.CAP_PROP_POS_MSEC)
         metadata.append({
             "frame_idx": frame_idx,
             "x_timestamp": x_timestamp,
@@ -220,16 +225,8 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
         
         frame_idx += 1
         
-        if camera_handler.debug:
-            print(f"Frame {frame_idx} captured from {serial_idx} with timestamp {x_timestamp}")
-            
-        if frame_idx >= 3:
-            times = np.array([md["x_timestamp"] for md in metadata[max(0, frame_idx - 50):-1]])
-            deltas = np.diff(times)
-            fps = 1 / np.mean(deltas)
-        else:
-            fps = 0.0
-            
+        # if camera_handler.debug:
+        #     print(f"Frame {frame_idx} captured from {serial_idx} with timestamp {x_timestamp}")
         
         if stream_enabled or recording_enabled:
             frame_cv = frame
@@ -240,41 +237,40 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
             if camera_handler.debug:
                 print(f"Terminating USB camera {serial_idx}.")
             break
-                    
+        
         try:
             camera_handler.stream_qs[thr_idx].put_nowait({
-                "metadata": metadata.copy(),
-                "time_steps": vtimer.get(),
+                "metadata": metadata[-1],
                 "fps": fps,
                 "frame": frame_cv.copy() if stream_enabled else None
             })
         except queue.Full:
-            try:
-                camera_handler.stream_qs[thr_idx].get_nowait()  # drop oldest
-                camera_handler.stream_qs[thr_idx].put_nowait({
-                    "metadata": metadata.copy(),
-                    "time_steps": vtimer.get(),
-                    "fps": fps,
-                    "frame": frame_cv.copy() if stream_enabled else None
-                })
-            except queue.Empty:
-                pass
+            pass
+            # try:
+            #     camera_handler.stream_qs[thr_idx].get_nowait()  # drop oldest
+            #     camera_handler.stream_qs[thr_idx].put_nowait({
+            #         "metadata": metadata.copy(),
+            #         "time_steps": vtimer.get(),
+            #         "fps": fps,
+            #         "frame": frame_cv.copy() if stream_enabled else None
+            #     })
+            # except queue.Empty:
+            #     pass
         
         if recording_enabled:
             try:
                 camera_handler.recording_qs[thr_idx].put_nowait({
-                    "metadata": metadata.copy(),
-                    "time_steps": vtimer.get(),
+                    "metadata": metadata[-1],
                     "fps": fps,
                     "frame": frame_cv.copy()
                 })
             except queue.Full:
                 pass
         
-        if count is not None and frame_idx >= count:
-            if camera_handler.debug:
-                print(f"Reached frame count limit for USB camera {serial_idx}.")
-            break
+        # if count is not None and frame_idx >= count:
+        #     if camera_handler.debug:
+        #         print(f"Reached frame count limit for USB camera {serial_idx}.")
+        #     break
     
     cap.release()
 
@@ -287,6 +283,7 @@ def record_frames_from_usb(camera_handler, thr_idx, count=None, stream_enabled=F
 def record_frames_multithreaded(camera_handler, count=None, stream_enabled=False, recording_enabled=False, request_sync_enabled=False, trigger_enabled=False):
         # Start threads for each url
         threads = []
+        threads_rec = []
         
         # Reset events and results
         camera_handler.ev_request_terminate.clear()
@@ -294,6 +291,9 @@ def record_frames_multithreaded(camera_handler, count=None, stream_enabled=False
         for idx, url in enumerate(camera_handler.urls):
             if type(url) == int:
                 t = threading.Thread(target=record_frames_from_usb, args=(camera_handler, idx, count, stream_enabled, recording_enabled))
+                if recording_enabled:
+                    t_rec = threading.Thread(target=save_frames_threaded, args=(camera_handler, idx, camera_handler.capture_cam_labels[idx], camera_handler.capture_folder_path))
+                    threads_rec.append(t_rec)
             else:
                 t = threading.Thread(target=record_frames_from_ip, args=(camera_handler, idx, count, stream_enabled, recording_enabled, trigger_enabled))
             threads.append(t)
@@ -310,25 +310,64 @@ def record_frames_multithreaded(camera_handler, count=None, stream_enabled=False
         for t in threads:
             t.start()
 
+        for t_rec in threads_rec:
+            t_rec.start()
+
         camera_handler.ev_running.set()
 
         # Wait for all threads to finish
         for t in threads:
             t.join()
 
+        for t_rec in threads_rec:
+            t_rec.join()
+
         camera_handler.ev_running.clear()
 
         return
     
 
+def save_frames_threaded(camera_handler, thr_idx, cam_label, capture_folder_path):
+    while True:
+        if camera_handler.ev_request_terminate.is_set():
+            break
+        try:
+            frame_q_data = camera_handler.recording_qs[thr_idx].get(timeout=0.1)
+            save_frame(frame_q_data["frame"], frame_q_data["metadata"]["frame_idx"], frame_q_data["metadata"]["x_timestamp_from_start"], cam_label, capture_folder_path)
+        except queue.Empty:
+            # wait for a short time to avoid busy waiting
+            time.sleep(0.01)
+            continue
+    
+    # gather remaining frames after termination
+    while not camera_handler.recording_qs[thr_idx].empty():
+        try:
+            frame_q_data = camera_handler.recording_qs[thr_idx].get_nowait()
+            save_frame(frame_q_data["frame"], frame_q_data["metadata"]["frame_idx"], frame_q_data["metadata"]["x_timestamp_from_start"], cam_label, capture_folder_path)
+        except queue.Empty:
+            break
+    
+
+def save_frame(frame, frame_id, timestamp, cam_label, capture_folder_path):
+    import os
+    subfolder_path = os.path.join(capture_folder_path, cam_label)
+    # frame_id with leading zeros for better sorting
+    frame_id_str = f"{frame_id:06d}"
+    fname = os.path.join(subfolder_path, f"frame_{frame_id_str}_timestamp_{timestamp:.3f}.png")
+    print(f"Saving frame to {fname}")
+    cv2.imwrite(fname, frame)
+
+
 #  Class mostly used for thread synchronization
 class CameraHandler:
-    def __init__(self, urls, adapter_ip=None, debug=False):
+    def __init__(self, urls, capture_folder_path, capture_cam_labels, adapter_ip=None, debug=False):
         self.urls = urls
         self.adapter_ip = adapter_ip
         self.session = None
         self.debug = debug
-        
+        self.capture_folder_path = capture_folder_path
+        self.capture_cam_labels = capture_cam_labels
+
         # Events
 
         self.ev_request_terminate = multiprocessing.Event()
