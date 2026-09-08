@@ -1,0 +1,11 @@
+numpy
+matplotlib
+opencv-python
+requests
+torch
+torchvision
+tqdm
+scikit-image
+scikit-learn
+scikit-spatial
+websockets

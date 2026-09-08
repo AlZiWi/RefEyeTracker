@@ -1,40 +1,15 @@
-import json
-from math import dist
-import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from turtle import right
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-import re
 from pathlib import Path
 from typing import Optional, Tuple, List
 
-import pickle
+from app.data_structures import CameraCoordinateFrame, CameraParams, CameraParamsExtrinsic, CameraParamsIntrinsic, MonoCalibrationStatistics, MonoReprojectionErrors, StereoCalibrationResults
 
-# robust gegen "1746640.7596404." (trailing Punkt vor Dateiendung)
-FNAME_RE = re.compile(r"frame_(\d+).*?timestamp_([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
-
-def _parse_name(fname: str) -> Tuple[Optional[int], Optional[float]]:
-    """
-    Versucht frame-ID und Timestamp (float Sekunden, relativ) zu parsen.
-    Gibt (frame_id, ts_sec) zurück, jeweils None falls nicht gefunden.
-    """
-    m = FNAME_RE.search(fname)
-    if m:
-        fid = int(m.group(1))
-        # group(2) ist exakt ohne trailing '.', dank Regex
-        ts = float(m.group(2))
-        return fid, ts
-
-    # Fallback: nur frame_(\d+) vorhanden?
-    m2 = re.search(r"frame_(\d+)", fname, re.IGNORECASE)
-    if m2:
-        return int(m2.group(1)), None
-    return None, None
 
 # --- unchanged core ---
 def mad(x: np.ndarray) -> float:
@@ -162,53 +137,7 @@ def per_view_sampson(F: np.ndarray, imgL: list[np.ndarray], imgR: list[np.ndarra
         d = np.sqrt((xrT_F_xl**2) / (Fx_l[:,0]**2 + Fx_l[:,1]**2 + Ft_xr[:,0]**2 + Ft_xr[:,1]**2 + 1e-12))
         out.append(d.mean())
     return np.array(out, float)
-
-
-@dataclass
-class CameraParamsIntrinsic:
-    K: np.ndarray           # 3x3 intrinsic matrix (pixel units)
-    dist: np.ndarray        # distortion coefficients (k1, k2, p1, p2, k3)
-    map1: np.ndarray        # distortion maxtrix 1 (for cv2.remap)
-    map2: np.ndarray        # distortion maxtrix 2 (for cv2.remap)
-    f_mm: float
-    W_mm: float
-    H_mm: float
-    nx: int
-    ny: int
-    px_mm: float
-    py_mm: float
-    cx: float
-    cy: float
     
-@dataclass
-class CameraParamsExtrinsic:
-    R_wc: np.ndarray        # 3x3 world-from-camera rotation
-    t_wc: np.ndarray        # (3,1) camera center in world coordinates
-
-@dataclass
-class CameraParams:
-    intrinsic: CameraParamsIntrinsic
-    extrinsic: CameraParamsExtrinsic
-
-
-def camparams_to_dict(cp: CameraParams, summarize=True) -> Dict[str, Any]:
-    d = asdict(cp)
-    
-    # Convert arrays to lists (for JSON)
-    d["extrinsic"]["R_wc"] = cp.extrinsic.R_wc.tolist()
-    d["extrinsic"]["t_wc"] = cp.extrinsic.t_wc.tolist()
-    d["intrinsic"]["K"]    = cp.intrinsic.K.tolist()
-    d["intrinsic"]["dist"] = cp.intrinsic.dist.tolist()
-    
-    if not summarize:
-        d["intrinsic"]["map1"] = cp.intrinsic.map1.tolist()
-        d["intrinsic"]["map2"] = cp.intrinsic.map2.tolist()
-    else:
-        del d["intrinsic"]["map1"]
-        del d["intrinsic"]["map2"]
-
-    return d
-
 
 def build_camparams_from_K(
     K: np.ndarray,
@@ -216,9 +145,10 @@ def build_camparams_from_K(
     map1: np.ndarray,
     map2: np.ndarray,
     img_size: Tuple[int, int],           # (nx, ny)
-    R_wc: np.ndarray,
-    t_wc: np.ndarray,
-    pixel_pitch_mm: Optional[Tuple[float, float]] = None
+    R: np.ndarray,
+    t: np.ndarray,
+    pixel_pitch_mm: Tuple[float, float] = (1.0, 1.0),
+    statistics: Optional[MonoCalibrationStatistics] = None
 ) -> CameraParams:
     
     K = np.asarray(K, float).reshape(3, 3)
@@ -232,24 +162,27 @@ def build_camparams_from_K(
     if not (0.0 <= cx <= nx and 0.0 <= cy <= ny):
         print(f"[warn] principal point outside image: (cx,cy)=({cx:.1f},{cy:.1f}) not in [0,{nx}]x[0,{ny}]")
 
-    R_wc = np.asarray(R_wc, float).reshape(3, 3)
-    t_wc = np.asarray(t_wc, float).reshape(3, 1)
+    R = np.asarray(R, float).reshape(3, 3)
+    t = np.asarray(t, float).reshape(3, 1)
+    
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = R
+    T[:3, 3] = t.flatten()
+    
+    T_R = np.eye(4, dtype=float)
+    T_R[:3, :3] = R
+    
+    T_t = np.eye(4, dtype=float)
+    T_t[:3, 3] = t.flatten()
 
-    if pixel_pitch_mm is None:
-        px_mm = 1.0
-        py_mm = 1.0
-        f_mm  = fx
-        W_mm  = float(nx)
-        H_mm  = float(ny)
-    else:
-        px_mm, py_mm = map(float, pixel_pitch_mm)
-        f_mm_fx = fx * px_mm
-        f_mm_fy = fy * py_mm
-        f_mm = 0.5 * (f_mm_fx + f_mm_fy)
-        if abs(f_mm_fx - f_mm_fy) > 0.01 * max(abs(f_mm_fx), abs(f_mm_fy), 1.0):
-            print(f"[warn] fx*px_mm != fy*py_mm: {f_mm_fx:.6f} vs {f_mm_fy:.6f} mm (check pixel_pitch_mm or K anisotropy)")
-        W_mm = nx * px_mm
-        H_mm = ny * py_mm
+    px_mm, py_mm = map(float, pixel_pitch_mm)
+    f_mm_fx = fx * px_mm
+    f_mm_fy = fy * py_mm
+    f_mm = 0.5 * (f_mm_fx + f_mm_fy)
+    if abs(f_mm_fx - f_mm_fy) > 0.01 * max(abs(f_mm_fx), abs(f_mm_fy), 1.0):
+        print(f"[warn] fx*px_mm != fy*py_mm: {f_mm_fx:.6f} vs {f_mm_fy:.6f} mm (check pixel_pitch_mm or K anisotropy)")
+    W_mm = nx * px_mm
+    H_mm = ny * py_mm
 
     camera_params = CameraParams(
         intrinsic=CameraParamsIntrinsic(
@@ -266,58 +199,18 @@ def build_camparams_from_K(
             py_mm=py_mm,
             cx=cx,
             cy=cy,
+            statistics=statistics
         ),
         extrinsic=CameraParamsExtrinsic(
-            R_wc=R_wc,
-            t_wc=t_wc,
+            relative=CameraCoordinateFrame(
+                T=T,
+                T_R=T_R,
+                T_t=T_t
+            )
         )
     )
-    
+
     return camera_params
-
-
-def list_images(folder: Path) -> List[Path]:
-    exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-    return sorted([p for p in folder.iterdir() if p.suffix.lower() in exts])
-
-
-def extract_frame_id(name: str) -> Optional[int]:
-    FRAME_RE = re.compile(r"frame_(\d+)[^-]*-timestamp_", re.IGNORECASE)
-    m = FRAME_RE.search(name)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def pair_stereo_images(left_dir: Path, right_dir: Path, verbose: bool=False) -> List[Tuple[Path, Path]]:
-    left_imgs = list_images(left_dir)
-    right_imgs = list_images(right_dir)
-    left_map = {}
-    right_map = {}
-    for p in left_imgs:
-        fid = extract_frame_id(p.name)
-        if fid is not None:
-            left_map[fid] = p
-        elif verbose:
-            print(f"[dbg] left: Name passt nicht zum Pattern -> {p.name}")
-    for p in right_imgs:
-        fid = extract_frame_id(p.name)
-        if fid is not None:
-            right_map[fid] = p
-        elif verbose:
-            print(f"[dbg] right: Name passt nicht zum Pattern -> {p.name}")
-    common = sorted(set(left_map.keys()) & set(right_map.keys()))
-    pairs = [(left_map[fid], right_map[fid]) for fid in common]
-    if not pairs:
-        raise RuntimeError("Keine passenden Bildpaare gefunden. Prüfe Dateinamen und Ordner." )
-    missing_l = sorted(set(right_map.keys()) - set(left_map.keys()))
-    missing_r = sorted(set(left_map.keys()) - set(right_map.keys()))
-    if missing_l:
-        print(f"[warn] {len(missing_l)} Frames nur rechts vorhanden (werden ignoriert), z.B.: {missing_l[:5]}")
-    if missing_r:
-        print(f"[warn] {len(missing_r)} Frames nur links vorhanden (werden ignoriert), z.B.: {missing_r[:5]}")
-    print(f"[info] Gefundene Stereo-Paare: {len(pairs)}")
-    return pairs
 
 
 def build_object_points(pattern_size: Tuple[int, int], square_size_mm: float) -> np.ndarray:
@@ -333,7 +226,7 @@ def detect_corners(img, pattern_size, verbose=False):
     # 1) SB (super robust)
     # zla2fe added markers
     ok, corners, meta = cv2.findChessboardCornersSBWithMeta(
-        gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE + cv2.CALIB_CB_ACCURACY# + cv2.CALIB_CB_MARKER  # zla2fe appears to be slow
+        gray, pattern_size, flags=cv2.CALIB_CB_ACCURACY + cv2.CALIB_CB_EXHAUSTIVE# + cv2.CALIB_CB_MARKER  # zla2fe appears to be slow
     )
     flipped = False
     if not ok:
@@ -348,7 +241,10 @@ def detect_corners(img, pattern_size, verbose=False):
         corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), term)
     else:
         if meta[0,0] == 2:  # detected corners start at bottom of calibration pattern instead of top -> rotate arrays (meta == 2 -> top-left corner of white cell)
+            # rotate corners and meta by 180 degrees. Needs to reshape to 2D grid first, then rotate, then reshape back to 1D list of corners
+            corners = corners.reshape(meta.shape[0], meta.shape[1], 2)
             corners = np.rot90(corners, 2)
+            corners = corners.reshape(-1, 2)
             meta = np.rot90(meta, 2)
             flipped = True
     if verbose:
@@ -383,6 +279,7 @@ def make_holdout_indices(n: int, holdout_ratio: float = 0.2, seed: int = 42):
     return calib, hold
 # ----------------------------------------------------------------------------
 # ============================================================================
+    
 
 
 def compute_mono_reproj_errors(
@@ -392,7 +289,7 @@ def compute_mono_reproj_errors(
     tvecs: List[np.ndarray],
     K: np.ndarray,
     dist: np.ndarray
-) -> Dict[str, Any]:
+) -> MonoReprojectionErrors:
     per_view = []
     all_errs = []
     all_errs_2d = []
@@ -400,25 +297,25 @@ def compute_mono_reproj_errors(
         proj, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
         proj = proj.reshape(-1, 2)
         err = np.linalg.norm(imgp.reshape(-1, 2) - proj, axis=1)
-        per_view.append({
-            "index": i,
-            "mean_px": float(err.mean()),
-            "std_px": float(err.std()),
-            "max_px": float(err.max()),
-            "num_pts": int(err.size),
-        })
+        per_view.append(MonoReprojectionErrors.PerViewMonoReprojectionError(
+            index=i,
+            mean_px=float(err.mean()),
+            std_px=float(err.std()),
+            max_px=float(err.max()),
+            num_pts=int(err.size),
+        ))
         all_errs.append(err)
         all_errs_2d.append(imgp.reshape(-1, 2) - proj)
     all_errs = np.concatenate(all_errs) if all_errs else np.array([])
     all_errs_2d = np.concatenate(all_errs_2d) if all_errs_2d else np.array([])
-    return {
-        "mean_px": float(all_errs.mean()) if all_errs.size else None,
-        "std_px": float(all_errs.std()) if all_errs.size else None,
-        "max_px": float(all_errs.max()) if all_errs.size else None,
-        "per_view": per_view,
-        "all_errs": all_errs,
-        "all_errs_2d": all_errs_2d,
-    }
+    return MonoReprojectionErrors(
+        mean_px=float(all_errs.mean()) if all_errs.size > 0 else None,
+        std_px=float(all_errs.std()) if all_errs.size > 0 else None,
+        max_px=float(all_errs.max()) if all_errs.size > 0 else None,
+        per_view=per_view,
+        all_errs=all_errs,
+        all_errs_2d=all_errs_2d
+    )
 
 
 def per_view_reproj_error(objpoints, imgpoints, rvecs, tvecs, K, dist):
@@ -474,7 +371,7 @@ def vertical_disparity_via_remap(
 ):
 
     # 1) Rectify-Matrizen & Maps
-    R1, R2, P1, P2, Q, _, _, map1_l, map2_l, map1_r, map2_r = stereo_rectify(
+    R1, R2, P1, P2, Q, _, _, map1_l, map2_l, map1_r, map2_r = cv2.stereoRectify(
         K1, dist1, K2, dist2, image_size, R, T, alpha=0.0
     )
 
@@ -520,156 +417,6 @@ def vertical_disparity_via_remap(
         "n": int(dy_all.size),
         "used_pairs": used
     }
-    
-
-def pair_stereo_images_smart(
-    left_dir: Path,
-    right_dir: Path,
-    max_dt_ms: float = 2.0,
-    allow_cross_id: bool = True,
-    verbose: bool = True,
-) -> List[Tuple[Path, Path]]:
-    """
-    Bildpaare finden mit Timestamp-Toleranz:
-      1) gleiche frame-ID + Δt ≤ max_dt_ms  (bevorzugt)
-      2) wenn zu wenige Paare, optional Cross-ID 1:1-Matching mit minimalem Δt (≤ max_dt_ms)
-      3) wenn keine Timestamps gefunden → Fallback: Frame-ID Matching ohne Timestamps
-
-    Rückgabe: Liste [(left_path, right_path), ...], nach left frame-ID sortiert (falls vorhanden).
-    """
-    L = [(p, *_parse_name(p.name)) for p in list_images(left_dir)]
-    R = [(p, *_parse_name(p.name)) for p in list_images(right_dir)]
-
-    # Split nach: mit/ohne Timestamp
-    L_ts = [(p, fid, ts) for (p, fid, ts) in L if ts is not None and fid is not None]
-    R_ts = [(p, fid, ts) for (p, fid, ts) in R if ts is not None and fid is not None]
-    L_id = {fid: p for (p, fid, ts) in L if fid is not None}
-    R_id = {fid: p for (p, fid, ts) in R if fid is not None}
-
-    pairs: List[Tuple[Path, Path]] = []
-    used_right = set()
-    dt_thresh = max_dt_ms / 1000.0  # in Sekunden
-
-    # ---------- A) gleiche frame-ID, Δt <= max_dt_ms ----------
-    if L_ts and R_ts:
-        R_by_id = {}
-        for p, fid, ts in R_ts:
-            R_by_id.setdefault(fid, []).append((p, ts))
-        kept_A = 0
-        dropped_out_of_dt = 0
-        for pL, fidL, tsL in L_ts:
-            if fidL in R_by_id:
-                # nimm rechte mit minimalem Δt
-                cand = min(R_by_id[fidL], key=lambda x: abs(tsL - x[1]))
-                pR, tsR = cand
-                if abs(tsL - tsR) <= dt_thresh and pR not in used_right:
-                    pairs.append((pL, pR))
-                    used_right.add(pR)
-                    kept_A += 1
-                else:
-                    dropped_out_of_dt += 1
-        if verbose:
-            print(f"[pair] gleiche frame-ID & Δt≤{max_dt_ms}ms: keep={kept_A}, drop_dt={dropped_out_of_dt}")
-
-    # ---------- B) Cross-ID (optional), falls noch wenig Paare ----------
-    # (z. B. wenn Kameras nicht exakt gemeinsam zählen)
-    if allow_cross_id and L_ts and R_ts:
-        # Rechte, die noch frei sind:
-        free_R = [(p, fid, ts) for (p, fid, ts) in R_ts if p not in used_right]
-        if verbose:
-            print(f"[pair] cross-id phase: freie R={len(free_R)}; bereits gepaart={len(pairs)}")
-        # Greedy: für jede linke wähle rechtes mit minimalem Δt, 1:1, falls unter Schwelle
-        added_B = 0
-        right_taken = set()
-        for pL, fidL, tsL in L_ts:
-            # wenn pL bereits gepaart? (über frame-ID passiert implizit nicht)
-            # Suche freien R mit min Δt
-            best = None
-            best_dt = None
-            best_idx = -1
-            for idx, (pR, fidR, tsR) in enumerate(free_R):
-                if pR in used_right or idx in right_taken:
-                    continue
-                dt = abs(tsL - tsR)
-                if best_dt is None or dt < best_dt:
-                    best_dt, best = dt, (idx, pR)
-            if best is not None and best_dt <= dt_thresh:
-                idx, pR = best
-                if (pL, pR) not in pairs:
-                    pairs.append((pL, pR))
-                    used_right.add(pR)
-                    right_taken.add(idx)
-                    added_B += 1
-        if verbose:
-            print(f"[pair] cross-id ergänzt: +{added_B} Paare")
-    
-    # ---------- B2) YYYY_MM_DD_HH_MM_DD Suffix Matching (optional) ----------
-    if allow_cross_id and not pairs:
-        def _parse_datetime_suffix(name: str) -> Optional[str]:
-            m = re.search(r"(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})", name)
-            if m:
-                return m.group(1)
-            return None
-
-        L_dt = {}
-        R_dt = {}
-        for p, fid, ts in L:
-            dt_suff = _parse_datetime_suffix(p.name)
-            if dt_suff is not None:
-                L_dt[dt_suff] = p
-        for p, fid, ts in R:
-            dt_suff = _parse_datetime_suffix(p.name)
-            if dt_suff is not None:
-                R_dt[dt_suff] = p
-        common_dt = sorted(set(L_dt.keys()) & set(R_dt.keys()))
-        added_B2 = 0
-        for dt_suff in common_dt:
-            pL = L_dt[dt_suff]
-            pR = R_dt[dt_suff]
-            if (pL, pR) not in pairs:
-                pairs.append((pL, pR))
-                added_B2 += 1
-        if verbose and added_B2 > 0:
-            print(f"[pair] datetime-suffix ergänzt: +{added_B2} Paare")
-
-    # ---------- C) Fallback: kein Timestamp nutzbar → Frame-ID Matching ----------
-    if not pairs:
-        if verbose:
-            print("[pair] Fallback: keine/nur spärliche Timestamps erkannt → Frame-ID Matching ohne Δt.")
-        common = sorted(set(L_id.keys()) & set(R_id.keys()))
-        for fid in common:
-            pairs.append((L_id[fid], R_id[fid]))
-        if verbose:
-            print(f"[pair] Fallback-Paare: {len(pairs)}")
-
-    # ---------- Aufräumen: sortiert zurückgeben ----------
-    def key_fn(pLR: Tuple[Path, Path]) -> int:
-        fid, _ = _parse_name(pLR[0].name)
-        return fid if fid is not None else 0
-
-    pairs_sorted = sorted(pairs, key=key_fn)
-
-    # ---------- Reporting ----------
-    if verbose:
-        # Δt-Statistik nur für Paare mit Timestamp
-        dts_ms = []
-        for pL, pR in pairs_sorted:
-            _, fidL, tsL = pL, *_parse_name(pL.name)
-            _, fidR, tsR = pR, *_parse_name(pR.name)
-            if tsL is not None and tsR is not None:
-                dts_ms.append(abs(tsL - tsR) * 1000.0)
-        if dts_ms:
-            import numpy as np
-            dts = np.array(dts_ms, float)
-            print("[pair] Δt-Statistik (ms): mean={:.3f}, std={:.3f}, max={:.3f}, n={}".format(
-                dts.mean(), dts.std(), dts.max(), dts.size
-            ))
-        print(f"[info] Gefundene Stereo-Paare: {len(pairs_sorted)} (smart pairing)")
-
-    if not pairs_sorted:
-        raise RuntimeError("Keine passenden Bildpaare gefunden (auch nicht mit Timestamp/Cross-ID).")
-
-    return pairs_sorted
 
 
 def calibrate_stereo(
@@ -771,40 +518,6 @@ def rectify_distortion(K, dist, image_size):
     map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, P, image_size, cv2.CV_32FC1)
 
     return map1, map2
-
-
-def save_pkl(path: Path, data: Dict[str, Any]):
-    with open(path, 'wb') as handle:
-        pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"[ok] Gespeichert: {path}")
-
-
-# -------------------- Save JSON / NPZ --------------------
-def save_json(path: Path, data: Dict[str, Any]):
-    """JSON mit numpy-Handling + CameraParams-Unterstützung."""
-    def to_serializable(x, key=None):
-        if isinstance(x, np.ndarray):
-            return x.tolist()
-        if isinstance(x, (np.floating, np.integer)):
-            return x.item()
-        if isinstance(x, CameraParams):
-            return camparams_to_dict(x, summarize=True)
-        if isinstance(x, dict):
-            if key is not None:
-                # if key starts with "errs_mono_reproj", we remove the full error arrays to save space, since they can be very large and are already summarized in the same dict
-                if key.startswith("errs_mono_reproj"):
-                    del x["all_errs"]
-                    del x["all_errs_2d"]
-            return {k: to_serializable(v, k) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            return [to_serializable(v) for v in x]
-        return x
-
-    data2 = to_serializable(data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data2, f, indent=2, ensure_ascii=False)
-    print(f"[ok] Gespeichert: {path}")
 
 
 # --- PATCH: Rectified-Preview mit horizontalen Hilfslinien ------------------
@@ -924,14 +637,12 @@ def automatic_brightness_and_contrast(image: np.ndarray, clip_hist_percent: floa
     beta = -minimum_gray * alpha
     auto_result = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
     return auto_result, alpha, beta
+ 
 
-
-def run_mono_calibration(dir, pattern_size, square_size_mm, pixel_pitch_um, verbose=False):
+def run_opencv_mono_calibration(img_paths: list[Path], pattern_size: tuple[int, int], square_size_mm: float, pixel_pitch_mm: tuple[float, float], verbose=False) -> CameraParamsIntrinsic:
     # Pixel pitch µm → mm
-    px_mm = float(pixel_pitch_um[0]) / 1000.0
-    py_mm = float(pixel_pitch_um[1]) / 1000.0
-
-    paths = list_images(dir)
+    px_mm = pixel_pitch_mm[0]
+    py_mm = pixel_pitch_mm[1]
 
     # Corner Detection
     
@@ -940,7 +651,7 @@ def run_mono_calibration(dir, pattern_size, square_size_mm, pixel_pitch_um, verb
     img_points = []
     img_size = None
 
-    for i, path in enumerate(paths):
+    for i, path in enumerate(img_paths):
         
         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if img is None:
@@ -994,46 +705,87 @@ def run_mono_calibration(dir, pattern_size, square_size_mm, pixel_pitch_um, verb
     if verbose:
         print("[dbg] Mono reprojection 2 (px): mean={mean_px:.3f}, std={std_px:.3f}, max={max_px:.3f}".format(**errs_mono_reproj))
 
-    def estimate_magnification_from_chessboard(img_points, square_size_mm, pixel_pitch_mm):
-        lengths_px = []
-        for corners in img_points:
-            pts = corners.reshape(-1, 2)
-            # lokale Pixelabstände (horizontale Nachbarn)
-            seg = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
-            lengths_px.append(np.mean(seg))
-        mean_edge_px = float(np.mean(lengths_px))
-        M = (mean_edge_px * pixel_pitch_mm) / float(square_size_mm)
-        return M, mean_edge_px
+    # def estimate_magnification_from_chessboard(img_points, square_size_mm, pixel_pitch_mm):
+    #     lengths_px = []
+    #     for corners in img_points:
+    #         pts = corners.reshape(-1, 2)
+    #         # lokale Pixelabstände (horizontale Nachbarn)
+    #         seg = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
+    #         lengths_px.append(np.mean(seg))
+    #     mean_edge_px = float(np.mean(lengths_px))
+    #     M = (mean_edge_px * pixel_pitch_mm) / float(square_size_mm)
+    #     return M, mean_edge_px
 
-    M_est, edge_px = estimate_magnification_from_chessboard(img_points, square_size_mm, px_mm)
-    print(f"[scale] mean edge = {edge_px:.2f}px  →  M ≈ {M_est:.4f}")
+    #M_est, edge_px = estimate_magnification_from_chessboard(img_points, square_size_mm, px_mm)
+    #print(f"[scale] mean edge = {edge_px:.2f}px  →  M ≈ {M_est:.4f}")
     
     map1, map2 = rectify_distortion(K, dist, img_size)
+    
+    mono_calibration_result = CameraParamsIntrinsic(
+        K=K,
+        dist=dist,
+        map1=map1,
+        map2=map2,
+        f_mm=np.mean([K[0,0]*px_mm, K[1,1]*py_mm]),
+        nx=img_size[0],
+        ny=img_size[1],
+        px_mm=px_mm,
+        py_mm=py_mm,
+        W_mm=img_size[0]*px_mm,
+        H_mm=img_size[1]*py_mm,
+        cx=K[0,2],
+        cy=K[1,2],
+        
+        statistics=MonoCalibrationStatistics(
+            rms=rms,
+            errs_mono_reproj_initial=errs_mono_reproj_initial,
+            errs_mono_reproj=errs_mono_reproj,
+            num_images=len(obj_points)
+        )
+    )
 
-    return rms, K, dist, rvecs, tvecs, map1, map2, errs_mono_reproj_initial, errs_mono_reproj
+    return mono_calibration_result
 
 
-def run_calibration(
-    left_dir: Path,
-    right_dir: Path,
-    pattern_size: Tuple[int, int],  # cols, rows, inner corners!
+def initialize_stereo_calibration_results(camera_params_0: CameraParams, camera_params_1: CameraParams, R: np.ndarray, t: np.ndarray, E: np.ndarray, F: np.ndarray) -> StereoCalibrationResults:
+    camera_params_0.extrinsic.relative.origin = np.array([[0],[0],[0],[1]])
+    camera_params_0.extrinsic.relative.x = np.array([[1],[0],[0],[1]])
+    camera_params_0.extrinsic.relative.y = np.array([[0],[1],[0],[1]])
+    camera_params_0.extrinsic.relative.z = np.array([[0],[0],[1],[1]])
+
+    T = camera_params_1.extrinsic.relative.T
+    T_R = camera_params_1.extrinsic.relative.T_R
+
+    camera_params_1.extrinsic.relative.origin = T @ camera_params_0.extrinsic.relative.origin
+    camera_params_1.extrinsic.relative.x = T_R @ camera_params_0.extrinsic.relative.x
+    camera_params_1.extrinsic.relative.y = T_R @ camera_params_0.extrinsic.relative.y
+    camera_params_1.extrinsic.relative.z = T_R @ camera_params_0.extrinsic.relative.z
+    
+    results = StereoCalibrationResults(
+        camera_params_0=camera_params_0,
+        camera_params_1=camera_params_1,
+        R=R,
+        t=t,
+        E=E,
+        F=F,
+    )
+    
+    return results
+
+
+def run_opencv_stereo_calibration(
+    img_path_pairs: List[Tuple[Path, Path]],
+    pattern_size: Tuple[int, int],  # cols, rows, inner corners only!
     square_size_mm: float,
-    pixel_pitch_um: Tuple[float, float],
-    out_dir: Path,
-    out_filename: str,
+    pixel_pitch_mm: Tuple[float, float],
     left_dir_mono = None,  # optional separate directory for mono calibration
     right_dir_mono = None,
-    rectify_alpha: float = 0.0,
     verbose: bool = False,
-) -> Dict[str, Any]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+) -> StereoCalibrationResults:
+    
     # Pixel pitch µm → mm
-    px_mm = float(pixel_pitch_um[0]) / 1000.0
-    py_mm = float(pixel_pitch_um[1]) / 1000.0
-
-    # 1) Paare finden
-    pairs = pair_stereo_images_smart(left_dir, right_dir, max_dt_ms=2.0)
+    px_mm = pixel_pitch_mm[0]
+    py_mm = pixel_pitch_mm[1]
     
     # 2) Ecken detektieren
     objp = build_object_points(pattern_size, float(square_size_mm))
@@ -1043,7 +795,7 @@ def run_calibration(
 
     img_size: Optional[Tuple[int, int]] = None
 
-    for i, (lp, rp) in enumerate(pairs):
+    for i, (lp, rp) in enumerate(img_path_pairs):
         imgl = cv2.imread(str(lp), cv2.IMREAD_GRAYSCALE)
         imgr = cv2.imread(str(rp), cv2.IMREAD_GRAYSCALE)
         if imgl is None or imgr is None:
@@ -1154,8 +906,8 @@ def run_calibration(
     # Optional: Separate Monokalibrierung mit eigenen Bildern (falls left_dir_mono / right_dir_mono angegeben)
     if left_dir_mono is not None and right_dir_mono is not None:
         print("[info] Separate Monokalibrierung mit eigenen Bildern...")
-        rms_l_mono, K_l_mono, dist_l_mono, rvecs_l_mono, tvecs_l_mono, map1_l_mono, map2_l_mono, errs_mono_reproj_initial_l_mono, errs_mono_reproj_l_mono = run_mono_calibration(left_dir_mono, pattern_size, square_size_mm, pixel_pitch_um, verbose=verbose)
-        rms_r_mono, K_r_mono, dist_r_mono, rvecs_r_mono, tvecs_r_mono, map1_r_mono, map2_r_mono, errs_mono_reproj_initial_r_mono, errs_mono_reproj_r_mono = run_mono_calibration(right_dir_mono, pattern_size, square_size_mm, pixel_pitch_um, verbose=verbose)
+        rms_l_mono, K_l_mono, dist_l_mono, rvecs_l_mono, tvecs_l_mono, map1_l_mono, map2_l_mono, errs_mono_reproj_initial_l_mono, errs_mono_reproj_l_mono = run_opencv_mono_calibration(left_dir_mono, pattern_size, square_size_mm, px_mm, verbose=verbose)
+        rms_r_mono, K_r_mono, dist_r_mono, rvecs_r_mono, tvecs_r_mono, map1_r_mono, map2_r_mono, errs_mono_reproj_initial_r_mono, errs_mono_reproj_r_mono = run_opencv_mono_calibration(right_dir_mono, pattern_size, square_size_mm, px_mm, verbose=verbose)
         print(f"[mono-separat] RMS links:  {rms_l_mono:.4f}")
         print(f"[mono-separat] RMS rechts: {rms_r_mono:.4f}")
         
@@ -1176,7 +928,7 @@ def run_calibration(
 
     # 4) Stereokalibrierung
     # --- Stereo #1 (mit fixierten Intrinsics) -----------------------------------
-    rms_stereo_1, K_l, dist_l, K_r, dist_r, R, T, E, F = calibrate_stereo(obj_points_cal, img_points_l_cal, img_points_r_cal, img_size, K_l, dist_l, K_r, dist_r)
+    rms_stereo_1, K_l, dist_l, K_r, dist_r, R, t, E, F = calibrate_stereo(obj_points_cal, img_points_l_cal, img_points_r_cal, img_size, K_l, dist_l, K_r, dist_r)
     print(f"[stereo#1] RMS: {rms_stereo_1:.4f}")
 
     # --- [B] Paare mit hohem Sampson-Fehler entfernen ---------------------------
@@ -1194,7 +946,7 @@ def run_calibration(
         img_points_r_cal = [img_points_r_cal[i] for i in keepB]
         
         # Stereo #2 – final
-        rms_stereo_2, K_l, dist_l, K_r, dist_r, R, T, E, F = calibrate_stereo(obj_points_cal, img_points_l_cal, img_points_r_cal, img_size, K_l, dist_l, K_r, dist_r)
+        rms_stereo_2, K_l, dist_l, K_r, dist_r, R, t, E, F = calibrate_stereo(obj_points_cal, img_points_l_cal, img_points_r_cal, img_size, K_l, dist_l, K_r, dist_r)
 
         print(f"[stereo#2] RMS: {rms_stereo_2:.4f}  (vorher {rms_stereo_1:.4f})")
         rms_stereo = rms_stereo_2
@@ -1202,86 +954,64 @@ def run_calibration(
         print("[filter-sampson] keine Paare entfernt")
         rms_stereo = rms_stereo_1
 
-    epi_hold = compute_stereo_epipolar_error(img_points_l_hold, img_points_r_hold, F) if hold_idx else None
-    rect_hold = vertical_disparity_stats(img_points_l_hold, img_points_r_hold, K_l, dist_l, K_r, dist_r, R, T,
-                                         img_size) if hold_idx else None
+    # epi_hold = compute_stereo_epipolar_error(img_points_l_hold, img_points_r_hold, F) if hold_idx else None
+    # rect_hold = vertical_disparity_stats(img_points_l_hold, img_points_r_hold, K_l, dist_l, K_r, dist_r, R, T, img_size) if hold_idx else None
 
     print(f"[stereo] RMS (refit, filtered & fix-intrinsic): {rms_stereo:.4f}")
-    if verbose:
-        print("[dbg] Epipolar (Sampson) (px): mean={mean_px:.3f}, std={std_px:.3f}, max={max_px:.3f}".format(**epi_hold))
+    # if verbose:
+    #     print("[dbg] Epipolar (Sampson) (px): mean={mean_px:.3f}, std={std_px:.3f}, max={max_px:.3f}".format(**epi_hold))
 
     # 5) Welt = linke Kamera
     R_wc_l = np.eye(3, dtype=float)
     t_wc_l = np.zeros((3, 1), dtype=float)
-    C2_w = -R.T @ T.reshape(3, 1)
+    C2_w = -R.T @ t.reshape(3, 1)
     R_wc_r = R.T
     t_wc_r = C2_w
 
     # 6) Rectify
+    ## Vertical Disparity is disabled because cameras are not aligned
     # R1, R2, P1, P2, Q, roi1, roi2, map1_l, map2_l, map1_r, map2_r = stereo_rectify(
     #     K1, dist1, K2, dist2, img_size, R, T, alpha=float(rectify_alpha)
     # )
 
     # Type checks
-    for M, name in [(K_r, "K_r"), (K_l, "K_l"), (dist_r, "dist_r"), (dist_l, "dist_l"), (R, "R"), (T, "T")]:
+    for M, name in [(K_r, "K_r"), (K_l, "K_l"), (dist_r, "dist_r"), (dist_l, "dist_l"), (R, "R"), (t, "t")]:
         assert isinstance(M, np.ndarray), f"{name} must be numpy.ndarray, got {type(M)}"
         assert M.dtype in (np.float32, np.float64), f"{name}.dtype must be float32/64, got {M.dtype}"
 
+    ## Vertical Disparity is disabled because cameras are not aligned
     # Robustes Printing
-    def _sf(x):
-        return f"{x:.3f}" if x is not None else "NaN"
+    # def _sf(x):
+    #     return f"{x:.3f}" if x is not None else "NaN"
 
-    if epi_hold:
-        print(f"[hold-out] Sampson (px): mean={_sf(epi_hold['mean_px'])}, "
-              f"std={_sf(epi_hold['std_px'])}, max={_sf(epi_hold['max_px'])}, n={len(epi_hold['per_view'])}")
-    if rect_hold and rect_hold.get("mean_abs_px") is not None:
-        print(f"[hold-out] Vertikale Disparität |dy| (px): mean_abs={_sf(rect_hold['mean_abs_px'])}, "
-              f"std={_sf(rect_hold['std_px'])}, max_abs={_sf(rect_hold['max_abs_px'])}, n={rect_hold['n']}")
-    else:
-        print("[hold-out] Vertikale Disparität: keine gültigen Werte (keine Ecken/NaN)")
+    # if epi_hold:
+    #     print(f"[hold-out] Sampson (px): mean={_sf(epi_hold['mean_px'])}, "
+    #           f"std={_sf(epi_hold['std_px'])}, max={_sf(epi_hold['max_px'])}, n={len(epi_hold['per_view'])}")
+    # if rect_hold and rect_hold.get("mean_abs_px") is not None:
+    #     print(f"[hold-out] Vertikale Disparität |dy| (px): mean_abs={_sf(rect_hold['mean_abs_px'])}, "
+    #           f"std={_sf(rect_hold['std_px'])}, max_abs={_sf(rect_hold['max_abs_px'])}, n={rect_hold['n']}")
+    # else:
+    #     print("[hold-out] Vertikale Disparität: keine gültigen Werte (keine Ecken/NaN)")
         
     # 7) CameraParams
-    camera_params_0 = build_camparams_from_K(K_l, dist_l, map1_l, map2_l, img_size, R_wc_l, t_wc_l, (px_mm, py_mm))
-    camera_params_1 = build_camparams_from_K(K_r, dist_r, map1_r, map2_r, img_size, R_wc_r, t_wc_r, (px_mm, py_mm))
+    camera_params_0 = build_camparams_from_K(K_l, dist_l, map1_l, map2_l, img_size, R_wc_l, t_wc_l, (px_mm, py_mm), MonoCalibrationStatistics(errs_mono_reproj_initial=errs_mono_reproj_initial_l, errs_mono_reproj=errs_mono_reproj_l))
+    camera_params_1 = build_camparams_from_K(K_r, dist_r, map1_r, map2_r, img_size, R_wc_r, t_wc_r, (px_mm, py_mm), MonoCalibrationStatistics(errs_mono_reproj_initial=errs_mono_reproj_initial_r, errs_mono_reproj=errs_mono_reproj_r))
     
-    # 8) Speichern
-    
-    results = {
-        "camera_params_0": camera_params_0,  # ← wird als dict geschrieben
-        "camera_params_1": camera_params_1,  # ← wird als dict geschrieben
-        "R": R,
-        "T": T,
-        "E": E,
-        "F": F,
-        "pattern_size": tuple(int(x) for x in pattern_size),
-        "square_size_mm": float(square_size_mm),
-        "errs_mono_reproj_l": errs_mono_reproj_l,
-        "errs_mono_reproj_r": errs_mono_reproj_r,
-        "errs_mono_reproj_initial_l": errs_mono_reproj_initial_l,
-        "errs_mono_reproj_initial_r": errs_mono_reproj_initial_r,
-
-        #"mono_rms": {"left": float(errs_mono_left["mean_px"]),"right": float(errs_mono_right["mean_px"])},
-        #"epi_err_mean": None if epi_hold is None else float(0),
-    }
-
-    save_pkl(out_dir / (out_filename + ".pkl"), results)
-    save_json(out_dir / (out_filename + ".json"), results)
+    results = initialize_stereo_calibration_results(camera_params_0, camera_params_1, R, t, E, F)
 
     # 9) Beispiel: eine rektifizierte Stichprobe speichern
-    try:
-        save_rectified_previews_with_guides(
-            pairs=pairs,
-            K1=K_l, dist1=dist_l, K2=K_r, dist2=dist_r, R=R, T=T,
-            image_size=img_size,  # ACHTUNG: (w,h)!
-            out_dir=out_dir,
-            count=2, step=40, alpha=0.0
-        )
+    # try:
+    #     save_rectified_previews_with_guides(
+    #         pairs=pairs,
+    #         K1=K_l, dist1=dist_l, K2=K_r, dist2=dist_r, R=R, T=T,
+    #         image_size=img_size,  # ACHTUNG: (w,h)!
+    #         out_dir=out_dir,
+    #         count=2, step=40, alpha=0.0
+    #     )
 
-        print("[ok] Beispiel-Rectify gespeichert (rectified_left_sample.png / rectified_right_sample.png)")
-    except Exception as e:
-        print(f"[warn] Beispiel-Rectify fehlgeschlagen: {e}")
-    
-    print(f"[ok] Alle Ergebnisse gespeichert in: {out_dir}")
+    #     print("[ok] Beispiel-Rectify gespeichert (rectified_left_sample.png / rectified_right_sample.png)")
+    # except Exception as e:
+    #     print(f"[warn] Beispiel-Rectify fehlgeschlagen: {e}")
 
     return results
 

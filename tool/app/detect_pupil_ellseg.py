@@ -10,7 +10,6 @@ from typing import Dict, Any, Optional, Tuple
 import cv2
 import torch
 import numpy as np
-import tqdm
 # ---- EllSeg modules (import from the EllSeg repo)
 # Make sure this file sits inside the EllSeg repo folder or that folder is on sys.path
 # at the very top of detect_pupil_ellseg.py, before importing EllSeg modules
@@ -26,7 +25,7 @@ HERE = Path(__file__).resolve().parent
 # (…/Stereo_System must be on sys.path so we can import EllSeg.*)
 sys.path.insert(0, str(HERE.parent))
 
-from EllSeg.modelSummary import model_dict               # provides model_dict['ritnet_v3']
+from app.EllSeg.modelSummary import model_dict               # provides model_dict['ritnet_v3']
 # optional: EllSeg's helper can give nicer argmax, but we can do torch.argmax directly
 # from utils import get_predictions
 
