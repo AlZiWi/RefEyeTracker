@@ -9,3 +9,4 @@ scikit-image
 scikit-learn
 scikit-spatial
 websockets
+pupil-labs-uvc
