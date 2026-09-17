@@ -1,6 +1,7 @@
 from asyncio import subprocess
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 import multiprocessing
 import multiprocessing.synchronize
 import os
@@ -13,8 +14,9 @@ import threading
 import time
 import queue
 import sys
+import uvc.uvc_bindings as uvc
 
-from app.data_structures import CameraIndex
+from app.data_structures import CameraIndex, CameraType
 from app.utils import CaptureFolderManager
 
 
@@ -43,8 +45,8 @@ class VTimer:
             
     def get(self):
         return self.time_steps
-    
-    
+
+
 class CameraHandler:
     
     adapter_ip: str  # IP address of the network adapter to use for camera connections
@@ -52,6 +54,7 @@ class CameraHandler:
     debug: bool  # Debug flag for logging
     capture_folder_manager: CaptureFolderManager  # Manager for handling capture folders
     camera_indexes: list[CameraIndex]  # List of camera indexes for capturing
+    camera_types: dict[CameraIndex, CameraType]  # List of camera indexes for capturing
     urls: dict[CameraIndex, str]  # List of camera URLs or USB indices
     
     ev_request_terminate: multiprocessing.synchronize.Event  # Event to signal termination of camera capture
@@ -63,13 +66,14 @@ class CameraHandler:
     stream_qs: dict[CameraIndex, multiprocessing.Queue]  # List of queues for streaming frames
     recording_qs: dict[CameraIndex, multiprocessing.Queue]  # List of queues for recording frames
     
-    def __init__(self, camera_indexes: list[CameraIndex], urls: dict[CameraIndex, str], capture_folder_manager: CaptureFolderManager, adapter_ip: str | None=None, debug: bool=False):
+    def __init__(self, camera_indexes: list[CameraIndex], camera_types: dict[CameraIndex, CameraType], urls: dict[CameraIndex, str], capture_folder_manager: CaptureFolderManager, adapter_ip: str | None=None, debug: bool=False):
         self.urls = urls
         self.adapter_ip = adapter_ip
         self.session = None
         self.debug = debug
         self.capture_folder_manager = capture_folder_manager
         self.camera_indexes = camera_indexes
+        self.camera_types = camera_types
 
         # Events
 
@@ -88,7 +92,7 @@ class CameraHandler:
             self.stream_qs[camera_index] = multiprocessing.Queue(maxsize=1)
             self.recording_qs[camera_index] = multiprocessing.Queue()
 
-    
+
 @dataclass
 class CaptureTransferBufferFrame:
     frame_raw: Optional[np.ndarray] = None
@@ -96,7 +100,6 @@ class CaptureTransferBufferFrame:
     x_timestamp_from_start: Optional[float] = None
     frame_idx: Optional[int] = None
     fps: Optional[float] = None
-
 
 
 # TODO outdated
@@ -236,6 +239,15 @@ def record_frames_from_ip(camera_handler, thr_idx, stream_enabled=False, recordi
     return
 
 
+class Backend(Enum):
+    CV2 = 1
+    UVCLIB = 2
+
+class OSSELECT(Enum):
+    WINDOWS = 1
+    LINUX = 2
+    MACOS = 3
+
 def record_frames_from_usb(camera_handler: CameraHandler, camera_index: CameraIndex, stream_enabled: bool=False, recording_enabled: bool=False, external_trigger_enabled: bool=False):
     serial_idx = camera_handler.urls[camera_index]
 
@@ -243,44 +255,90 @@ def record_frames_from_usb(camera_handler: CameraHandler, camera_index: CameraIn
     FPS_WINDOW_LEN = 10
     fps_buffer = np.zeros(FPS_WINDOW_LEN)
     start_time = 0
+    
+    backend: Backend = Backend.UVCLIB
+    osselect: OSSELECT = OSSELECT.WINDOWS
 
-    api_preference = cv2.CAP_ANY  # default
-    if sys.platform == "win32":
-        api_preference = cv2.CAP_DSHOW  # DirectShow backend for Windows
-    elif sys.platform == "darwin":
-        api_preference = cv2.CAP_AVFOUNDATION  # AVFoundation backend for macOS
-    elif sys.platform.startswith("linux"):
-        api_preference = cv2.CAP_V4L2  # V4L2 backend for Linux
-        
+    if sys.platform == "darwin":
+        backend = Backend.CV2
+        osselect = OSSELECT.MACOS
+        cv2_api_preference = cv2.CAP_AVFOUNDATION  # AVFoundation backend for macOS
+    elif sys.platform.startswith("linux") or sys.platform == "win32":
+        backend = Backend.UVCLIB
+        if sys.platform == "win32":
+            osselect = OSSELECT.WINDOWS
+        else:
+            osselect = OSSELECT.LINUX
+
     # Apply trigger mode settings based on platform and external trigger flag
     if camera_index == CameraIndex.SC:
-        if sys.platform == "darwin":
-            # call ucv_utils to set trigger mode for macOS: ./uvc-util -V 0x0c45:0x636d -s auto-focus=true
-            auto_focus_str = "true" if external_trigger_enabled else "false"
-            ret = subprocess.run(["./app/uvc-util/uvc-util", "-V", "0x0c45:0x636d", "-s", f"auto-focus={auto_focus_str}"], capture_output=True, text=True)
-            print(f"Camera {serial_idx} autofocus set to {auto_focus_str}, return: {ret.stdout.strip()}")
-            ret = subprocess.run(["./app/uvc-util/uvc-util", "-V", "0x0c45:0x636d", "-g", "auto-focus"], capture_output=True, text=True)
-            print(f"Camera {serial_idx} autofocus set to {auto_focus_str}, actual value: {ret.stdout.strip()}")
-        
-    cap = cv2.VideoCapture(serial_idx, api_preference)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-    width = 240
-    height = 240
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, 60)
+        if osselect == OSSELECT.MACOS:
+            if backend == Backend.CV2:
+                # call ucv_utils to set trigger mode for macOS: ./uvc-util -V 0x0c45:0x636d -s auto-focus=true
+                auto_focus_str = "true" if external_trigger_enabled else "false"
+                ret = subprocess.run(["./app/uvc-util/uvc-util", "-V", "0x0c45:0x636d", "-s", f"auto-focus={auto_focus_str}"], capture_output=True, text=True)
+                print(f"Camera {serial_idx} autofocus set to {auto_focus_str}, return: {ret.stdout.strip()}")
+                ret = subprocess.run(["./app/uvc-util/uvc-util", "-V", "0x0c45:0x636d", "-g", "auto-focus"], capture_output=True, text=True)
+                print(f"Camera {serial_idx} autofocus set to {auto_focus_str}, actual value: {ret.stdout.strip()}")
+    
+    if backend == Backend.UVCLIB:
+        devices = uvc.device_list()
+        print(f"Found {len(devices)} UVC devices: {[dev['name'] for dev in devices]}")
+        cap = None
+        for device in devices:
+            print(device)
+            if device["name"] == serial_idx:
+                print(f"Found match by name")
+                cap = uvc.Capture(device["uid"])
+                cap.bandwidth_factor = 1.6
+                if camera_index == CameraIndex.SC:
+                    frame_width_setting = 800
+                    frame_height_setting = 600
+                    frame_fps_setting = 60
+                else:
+                    frame_width_setting = 240
+                    frame_height_setting = 240
+                    frame_fps_setting = 60
+                for mode in cap.available_modes:
+                    if mode[:3] == (frame_width_setting, frame_height_setting, frame_fps_setting):
+                        cap.frame_mode = mode
+                        break
+                else:
+                    print(f"None of the available modes matched: {cap.available_modes}")
+                break
+
+        if cap is None:
+            print(f"Camera {serial_idx} not found")
+            return
+    elif backend == Backend.CV2:
+        serial_idx_int = int(serial_idx)
+        cap = cv2.VideoCapture(serial_idx_int, cv2_api_preference)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        if camera_index == CameraIndex.SC:
+            if osselect == OSSELECT.WINDOWS or osselect == OSSELECT.LINUX:
+                if external_trigger_enabled:
+                    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # remapped to trigger mode for some cameras
+                else:
+                    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # remapped to continuous autofocus mode for some cameras
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+            cap.set(cv2.CAP_PROP_FPS, 60)
+        else:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 240)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            cap.set(cv2.CAP_PROP_FPS, 60)
     
     # Apply trigger mode settings based on platform and external trigger flag
-    if camera_index == CameraIndex.SC:
-        if sys.platform == "win32" or sys.platform.startswith("linux"):
-            if external_trigger_enabled:
-                ok = cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # remapped to trigger mode for some cameras
-                actual_af = cap.get(cv2.CAP_PROP_AUTOFOCUS)
-                print(f"Camera {serial_idx} autofocus set to 1 {ok}, actual value: {actual_af}")
-            else:
-                ok = cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # remapped to continuous autofocus mode for some cameras
-                actual_af = cap.get(cv2.CAP_PROP_AUTOFOCUS)
-                print(f"Camera {serial_idx} autofocus set to 0 {ok}, actual value: {actual_af}")
+    #if camera_index == CameraIndex.SC:
+        #if osselect == OSSELECT.WINDOWS or osselect == OSSELECT.LINUX:
+            #if external_trigger_enabled:
+            #    ok = cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # remapped to trigger mode for some cameras
+            #    actual_af = cap.get(cv2.CAP_PROP_AUTOFOCUS)
+            #    print(f"Camera {serial_idx} autofocus set to 1 {ok}, actual value: {actual_af}")
+            #else:
+            #    ok = cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # remapped to continuous autofocus mode for some cameras
+            #    actual_af = cap.get(cv2.CAP_PROP_AUTOFOCUS)
+            #    print(f"Camera {serial_idx} autofocus set to 0 {ok}, actual value: {actual_af}")
     
     frame_idx = 0
     while True:
@@ -288,14 +346,30 @@ def record_frames_from_usb(camera_handler: CameraHandler, camera_index: CameraIn
             if camera_handler.debug:
                 print(f"Terminating USB camera {serial_idx}.")
             break
-        
-        ret, frame = cap.read()
-        
-        if not ret:
-            if camera_handler.debug:
-                print(f"Failed to read frame from USB camera {serial_idx}.")
-            continue  # Skip this iteration if frame read fails, can happen if camera is externally triggered and times out due to lack of trigger signals.
 
+        frame_data = None
+        if backend == Backend.UVCLIB:
+            try:
+                frame_data = cap.get_frame(timeout=0.001)
+            except TimeoutError:
+                continue
+            except uvc.InitError as err:
+                print(f"Failed to init camera {serial_idx}: {err}")
+                break
+            except uvc.StreamError as err:
+                print(f"Failed to get a frame for camera {serial_idx}: {err}")
+                continue
+            
+            frame = frame_data.bgr if hasattr(frame_data, "bgr") else frame_data.gray
+            if not frame_data.data_fully_received:
+                continue  # Skip this iteration if frame data is not fully received.
+        elif backend == Backend.CV2:
+            ret, frame = cap.read()
+            if not ret:
+                if camera_handler.debug:
+                    print(f"Failed to read frame from USB camera {serial_idx}.")
+                continue  # Skip this iteration if frame read fails, can happen if camera is externally triggered and times out due to lack of trigger signals.
+        
         if start_time == 0:
             start_time = time.perf_counter()
 
@@ -307,8 +381,12 @@ def record_frames_from_usb(camera_handler: CameraHandler, camera_index: CameraIn
             fps = 0.0
 
         x_timestamp = float(fps_buffer[frame_idx % curr_fps_window_len] - start_time)  # relative timestamp from start
-        #x_timestamp_hw = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        #x_frame_idx_hw = cap.get(cv2.CAP_PROP_POS_MSEC)
+        if backend == Backend.UVCLIB:
+            x_timestamp_hw = frame_data.timestamp  # hardware timestamp from camera
+            x_frame_idx_hw = frame_data.index  # hardware frame index from camera
+        elif backend == Backend.CV2:
+            x_timestamp_hw = cap.get(cv2.CAP_PROP_POS_MSEC)  # hardware timestamp from camera in seconds
+            x_frame_idx_hw = cap.get(cv2.CAP_PROP_POS_FRAMES)  # hardware frame index from camera
         
         # if camera_handler.debug:
         #     print(f"Frame {frame_idx} captured from {serial_idx} with timestamp {x_timestamp}")
@@ -353,7 +431,10 @@ def record_frames_from_usb(camera_handler: CameraHandler, camera_index: CameraIn
         
         frame_idx += 1
     
-    cap.release()
+    if backend == Backend.UVCLIB:
+        cap.close()
+    elif backend == Backend.CV2:
+        cap.release()
 
     if camera_handler.debug:
         print(f"USB camera {serial_idx} recording finished. Captured {frame_idx} frames.")
@@ -371,7 +452,8 @@ def record_frames_multithreaded(camera_handler: CameraHandler, stream_enabled: b
         
         for camera_index in camera_handler.camera_indexes:
             url = camera_handler.urls[camera_index]
-            if type(url) == int:
+            cam_type = camera_handler.camera_types[camera_index]
+            if cam_type == CameraType.USB:
                 t = threading.Thread(target=record_frames_from_usb, args=(camera_handler, camera_index, stream_enabled, recording_enabled, trigger_enabled))
                 if recording_enabled:
                     t_rec = threading.Thread(target=save_frames_threaded, args=(camera_handler, camera_index))

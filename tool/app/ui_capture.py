@@ -41,7 +41,7 @@ class UIFrameCameraSettings:
     eye_cam: bool
 
 # Helper constants
-_DEFAULT_CAMERA_URLS = [1, 2, 3, 4, 0]  # IP camera URLs and USB camera index (Find camera index via ffmpeg -f avfoundation -list_devices true -i "")
+_DEFAULT_CAMERA_URLS = ["vivarefsys2ro", "vivarefsys2ri", "vivarefsys2lo", "vivarefsys2li", "USB 2.0 Camera"]  # IP camera URLs and USB camera index (Find camera index via ffmpeg -f avfoundation -list_devices true -i "")
 _DEFAULT_CAMERA_TYPES = [CameraType.USB, CameraType.USB, CameraType.USB, CameraType.USB, CameraType.USB]
 DEFAULT_CAMERA_SETTINGS: dict[CameraIndex, UIFrameCameraSettings] = {
     CameraIndex.RO: UIFrameCameraSettings(
@@ -112,7 +112,7 @@ class UIAppCaptureState:
     capture_state: UICaptureState = UICaptureState.INACTIVE
     snapshot_state: UISnapshotState = UISnapshotState.IDLE
     curr_capture_cam_idxs: list[CameraIndex] = field(default_factory=list)
-    curr_capture_cam_urls: dict[CameraIndex, str|int] = field(default_factory=dict)
+    curr_capture_cam_urls: dict[CameraIndex, str] = field(default_factory=dict)
     camera_handler: CameraHandler | None = None
     capture_sync_mode: bool = False
     last_timestamp_auto_accept: float | None = None
@@ -416,14 +416,12 @@ class UITabCapture:
         if self.state.capture_state == UICaptureState.INACTIVE:
             self.state.curr_capture_cam_idxs = []
             self.state.curr_capture_cam_urls = {}
+            curr_capture_camera_types: dict[CameraIndex, CameraType] = {}
 
             for camera_index, cam_frame in self.ui_camera_frames.items():
                 if cam_frame.sv_active.get() == SV_CHECKBOX_ACTIVE:
-                    if CameraType(cam_frame.sv_type.get()) == CameraType.USB:
-                        self.state.curr_capture_cam_urls[camera_index] = int(cam_frame.sv_ip.get())
-                    else:
-                        self.state.curr_capture_cam_urls[camera_index] = cam_frame.sv_ip.get()
-
+                    self.state.curr_capture_cam_urls[camera_index] = cam_frame.sv_ip.get()
+                    curr_capture_camera_types[camera_index] = CameraType(cam_frame.sv_type.get())
                     self.state.curr_capture_cam_idxs.append(camera_index)
             
             self.state.capture_buffers.current = {
@@ -453,6 +451,7 @@ class UITabCapture:
             
             self.state.camera_handler = CameraHandler(
                 camera_indexes=self.state.curr_capture_cam_idxs,
+                camera_types=curr_capture_camera_types,
                 urls=self.state.curr_capture_cam_urls,
                 capture_folder_manager=self.state.folder_manager,
             )
