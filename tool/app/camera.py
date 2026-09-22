@@ -1,4 +1,3 @@
-from asyncio import subprocess
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
@@ -6,6 +5,8 @@ import multiprocessing
 import multiprocessing.synchronize
 import os
 import subprocess
+from pathlib import Path
+import struct
 from typing import Optional
 import requests
 import cv2
@@ -13,8 +14,6 @@ import numpy as np
 import threading
 import time
 import queue
-import sys
-import uvc.uvc_bindings as uvc
 
 from app.data_structures import CameraIndex, CameraType
 from app.utils import CaptureFolderManager
@@ -41,7 +40,7 @@ class VTimer:
     def time_print_log(self):
         print(f"Times:")
         for i in range(len(self.time_steps["names"])):
-            print(f"{self.time_steps["names"][i]}: {self.time_steps["deltas"][i]:0.3f}s")
+            print(f"{self.time_steps['names'][i]}: {self.time_steps['deltas'][i]:0.3f}s")
             
     def get(self):
         return self.time_steps
@@ -98,6 +97,7 @@ class CaptureTransferBufferFrame:
     frame_raw: Optional[np.ndarray] = None
     x_timestamp: Optional[float] = None
     x_timestamp_from_start: Optional[float] = None
+    x_timestamp_hw: Optional[float] = None
     frame_idx: Optional[int] = None
     fps: Optional[float] = None
 
@@ -162,7 +162,12 @@ def record_frames_from_ip(camera_handler, thr_idx, stream_enabled=False, recordi
                     print("#####  New frame  #####")
 
                 # JPEG boundaries
-                bstr = bstr[bstr.rfind(b'\xff\xd8'):bstr.rfind(b'\xff\xd9')+2]
+                jpeg_start = bstr.find(b'\xff\xd8')
+                jpeg_end = bstr.rfind(b'\xff\xd9')
+                if jpeg_start < 0 or jpeg_end < jpeg_start:
+                    bstr = b''
+                    continue
+                bstr = bstr[jpeg_start:jpeg_end + 2]
                 
                 metadata.append({
                     "frame_idx": curr_frame_count,
@@ -187,6 +192,9 @@ def record_frames_from_ip(camera_handler, thr_idx, stream_enabled=False, recordi
                 if stream_enabled or recording_enabled:
                     frame_np = np.frombuffer(bstr, np.uint8)
                     frame_cv = cv2.imdecode(frame_np, cv2.IMREAD_GRAYSCALE)
+                    if frame_cv is None:
+                        bstr = b''
+                        continue
                 else:
                     frame_cv = None
                     
@@ -239,209 +247,6 @@ def record_frames_from_ip(camera_handler, thr_idx, stream_enabled=False, recordi
     return
 
 
-class Backend(Enum):
-    CV2 = 1
-    UVCLIB = 2
-
-class OSSELECT(Enum):
-    WINDOWS = 1
-    LINUX = 2
-    MACOS = 3
-
-def record_frames_from_usb(camera_handler: CameraHandler, camera_index: CameraIndex, stream_enabled: bool=False, recording_enabled: bool=False, external_trigger_enabled: bool=False):
-    serial_idx = camera_handler.urls[camera_index]
-
-    # ring buffer for fps
-    FPS_WINDOW_LEN = 10
-    fps_buffer = np.zeros(FPS_WINDOW_LEN)
-    start_time = 0
-    
-    backend: Backend = Backend.UVCLIB
-    osselect: OSSELECT = OSSELECT.WINDOWS
-
-    if sys.platform == "darwin":
-        backend = Backend.CV2
-        osselect = OSSELECT.MACOS
-        cv2_api_preference = cv2.CAP_AVFOUNDATION  # AVFoundation backend for macOS
-    elif sys.platform.startswith("linux") or sys.platform == "win32":
-        backend = Backend.UVCLIB
-        if sys.platform == "win32":
-            osselect = OSSELECT.WINDOWS
-        else:
-            osselect = OSSELECT.LINUX
-
-    # Apply trigger mode settings based on platform and external trigger flag
-    if camera_index == CameraIndex.SC:
-        if osselect == OSSELECT.MACOS:
-            if backend == Backend.CV2:
-                # call ucv_utils to set trigger mode for macOS: ./uvc-util -V 0x0c45:0x636d -s auto-focus=true
-                auto_focus_str = "true" if external_trigger_enabled else "false"
-                ret = subprocess.run(["./app/uvc-util/uvc-util", "-V", "0x0c45:0x636d", "-s", f"auto-focus={auto_focus_str}"], capture_output=True, text=True)
-                print(f"Camera {serial_idx} autofocus set to {auto_focus_str}, return: {ret.stdout.strip()}")
-                ret = subprocess.run(["./app/uvc-util/uvc-util", "-V", "0x0c45:0x636d", "-g", "auto-focus"], capture_output=True, text=True)
-                print(f"Camera {serial_idx} autofocus set to {auto_focus_str}, actual value: {ret.stdout.strip()}")
-    
-    if backend == Backend.UVCLIB:
-        devices = uvc.device_list()
-        print(f"Found {len(devices)} UVC devices: {[dev['name'] for dev in devices]}")
-        cap = None
-        for device in devices:
-            print(device)
-            if device["name"] == serial_idx:
-                print(f"Found match by name")
-                cap = uvc.Capture(device["uid"])
-                cap.bandwidth_factor = 1.6
-                if camera_index == CameraIndex.SC:
-                    frame_width_setting = 800
-                    frame_height_setting = 600
-                    frame_fps_setting = 60
-                else:
-                    frame_width_setting = 240
-                    frame_height_setting = 240
-                    frame_fps_setting = 60
-                for mode in cap.available_modes:
-                    if mode[:3] == (frame_width_setting, frame_height_setting, frame_fps_setting):
-                        cap.frame_mode = mode
-                        break
-                else:
-                    print(f"None of the available modes matched: {cap.available_modes}")
-                break
-
-        if cap is None:
-            print(f"Camera {serial_idx} not found")
-            return
-    elif backend == Backend.CV2:
-        serial_idx_int = int(serial_idx)
-        cap = cv2.VideoCapture(serial_idx_int, cv2_api_preference)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-        if camera_index == CameraIndex.SC:
-            if osselect == OSSELECT.WINDOWS or osselect == OSSELECT.LINUX:
-                if external_trigger_enabled:
-                    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # remapped to trigger mode for some cameras
-                else:
-                    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # remapped to continuous autofocus mode for some cameras
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
-            cap.set(cv2.CAP_PROP_FPS, 60)
-        else:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 240)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-            cap.set(cv2.CAP_PROP_FPS, 60)
-    
-    # Apply trigger mode settings based on platform and external trigger flag
-    #if camera_index == CameraIndex.SC:
-        #if osselect == OSSELECT.WINDOWS or osselect == OSSELECT.LINUX:
-            #if external_trigger_enabled:
-            #    ok = cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # remapped to trigger mode for some cameras
-            #    actual_af = cap.get(cv2.CAP_PROP_AUTOFOCUS)
-            #    print(f"Camera {serial_idx} autofocus set to 1 {ok}, actual value: {actual_af}")
-            #else:
-            #    ok = cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # remapped to continuous autofocus mode for some cameras
-            #    actual_af = cap.get(cv2.CAP_PROP_AUTOFOCUS)
-            #    print(f"Camera {serial_idx} autofocus set to 0 {ok}, actual value: {actual_af}")
-    
-    frame_idx = 0
-    while True:
-        if camera_handler.ev_request_terminate.is_set():
-            if camera_handler.debug:
-                print(f"Terminating USB camera {serial_idx}.")
-            break
-
-        frame_data = None
-        if backend == Backend.UVCLIB:
-            try:
-                frame_data = cap.get_frame(timeout=0.001)
-            except TimeoutError:
-                continue
-            except uvc.InitError as err:
-                print(f"Failed to init camera {serial_idx}: {err}")
-                break
-            except uvc.StreamError as err:
-                print(f"Failed to get a frame for camera {serial_idx}: {err}")
-                continue
-            
-            frame = frame_data.bgr if hasattr(frame_data, "bgr") else frame_data.gray
-            if not frame_data.data_fully_received:
-                continue  # Skip this iteration if frame data is not fully received.
-        elif backend == Backend.CV2:
-            ret, frame = cap.read()
-            if not ret:
-                if camera_handler.debug:
-                    print(f"Failed to read frame from USB camera {serial_idx}.")
-                continue  # Skip this iteration if frame read fails, can happen if camera is externally triggered and times out due to lack of trigger signals.
-        
-        if start_time == 0:
-            start_time = time.perf_counter()
-
-        curr_fps_window_len = min(frame_idx + 1, FPS_WINDOW_LEN)
-        fps_buffer[frame_idx % curr_fps_window_len] = time.perf_counter()
-        if frame_idx > 1:
-            fps = 1.0 / (fps_buffer[(frame_idx) % curr_fps_window_len] - fps_buffer[(frame_idx + 1) % curr_fps_window_len]) * (float(curr_fps_window_len) - 1)
-        else:
-            fps = 0.0
-
-        x_timestamp = float(fps_buffer[frame_idx % curr_fps_window_len] - start_time)  # relative timestamp from start
-        if backend == Backend.UVCLIB:
-            x_timestamp_hw = frame_data.timestamp  # hardware timestamp from camera
-            x_frame_idx_hw = frame_data.index  # hardware frame index from camera
-        elif backend == Backend.CV2:
-            x_timestamp_hw = cap.get(cv2.CAP_PROP_POS_MSEC)  # hardware timestamp from camera in seconds
-            x_frame_idx_hw = cap.get(cv2.CAP_PROP_POS_FRAMES)  # hardware frame index from camera
-        
-        # if camera_handler.debug:
-        #     print(f"Frame {frame_idx} captured from {serial_idx} with timestamp {x_timestamp}")
-        
-        if stream_enabled or recording_enabled:
-            frame_cv = frame
-        else:
-            frame_cv = None
-            
-        if camera_handler.ev_request_terminate.is_set():
-            if camera_handler.debug:
-                print(f"Terminating USB camera {serial_idx}.")
-            break
-        
-        try:
-            camera_handler.stream_qs[camera_index].put_nowait(CaptureTransferBufferFrame(
-                frame_raw = frame_cv.copy() if stream_enabled else None,
-                x_timestamp = x_timestamp,
-                x_timestamp_from_start = x_timestamp,
-                frame_idx = frame_idx,
-                fps = fps,
-            ))
-        except queue.Full:
-            pass
-            # try:
-            #     camera_handler.stream_qs[thr_idx].get_nowait()  # drop oldest
-            #     camera_handler.stream_qs[thr_idx].put_nowait({
-            # except queue.Empty:
-            #     pass
-        
-        if recording_enabled:
-            try:
-                camera_handler.recording_qs[camera_index].put_nowait(CaptureTransferBufferFrame(
-                    frame_raw = frame_cv.copy(),
-                    x_timestamp = x_timestamp,
-                    x_timestamp_from_start = x_timestamp,
-                    frame_idx = frame_idx,
-                    fps = fps,
-                ))
-            except queue.Full:
-                pass
-        
-        frame_idx += 1
-    
-    if backend == Backend.UVCLIB:
-        cap.close()
-    elif backend == Backend.CV2:
-        cap.release()
-
-    if camera_handler.debug:
-        print(f"USB camera {serial_idx} recording finished. Captured {frame_idx} frames.")
-
-    return
-
-
 def record_frames_multithreaded(camera_handler: CameraHandler, stream_enabled: bool=False, recording_enabled: bool=False, request_sync_enabled: bool=False, trigger_enabled: bool=False):
         # Start threads for each url
         threads = []
@@ -455,11 +260,11 @@ def record_frames_multithreaded(camera_handler: CameraHandler, stream_enabled: b
             cam_type = camera_handler.camera_types[camera_index]
             if cam_type == CameraType.USB:
                 t = threading.Thread(target=record_frames_from_usb, args=(camera_handler, camera_index, stream_enabled, recording_enabled, trigger_enabled))
+            else:
+                t = threading.Thread(target=record_frames_from_ip, args=(camera_handler, camera_index, stream_enabled, recording_enabled, trigger_enabled))
                 if recording_enabled:
                     t_rec = threading.Thread(target=save_frames_threaded, args=(camera_handler, camera_index))
                     threads_rec.append(t_rec)
-            else:
-                t = threading.Thread(target=record_frames_from_ip, args=(camera_handler, camera_index, stream_enabled, recording_enabled, trigger_enabled))
             threads.append(t)
 
         if request_sync_enabled:
@@ -514,6 +319,181 @@ def save_frames_threaded(camera_handler: CameraHandler, camera_index: CameraInde
         except queue.Empty:
             break
             
+
+# Detect OS and set the appropriate libuvc binary path
+if os.name == "nt":
+    LIBUVC_BINARY = str(Path(__file__).parent / "libuvc_wrapper" / "libuvc_util_win.exe")
+elif os.name == "posix":
+    if os.uname().sysname == "Darwin":
+        LIBUVC_BINARY = str(Path(__file__).parent / "libuvc_wrapper" / "libuvc_util_mac")
+    else:
+        raise RuntimeError(f"Unsupported OS: {os.name}")
+else:
+    raise RuntimeError(f"Unsupported OS: {os.name}")
+
+STREAM_HEADER = struct.Struct("<4sIQIIIIQQ")
+STREAM_MAGIC = b"UVCF"
+FRAME_FORMAT_YUYV = 3
+FRAME_FORMAT_MJPEG = 7
+
+
+def _complete_jpeg(data):
+    start = data.find(b"\xff\xd8")
+    end = data.rfind(b"\xff\xd9")
+    if start < 0 or end < start:
+        return None
+    return data[start:end + 2]
+
+
+def _read_exact(stream, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = stream.read(size - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _print_process_errors(process, stop_event, camera_name):
+    for line in iter(process.stderr.readline, b""):
+        if line:
+            print(f"libuvc[{camera_name}]: {line.decode(errors='replace').rstrip()}")
+    stop_event.set()
+
+
+def _read_libuvc_stream(process, frames, stop_event):
+    try:
+        while not stop_event.is_set():
+            header_bytes = _read_exact(process.stdout, STREAM_HEADER.size)
+            if header_bytes is None:
+                print("libuvc stream ended unexpectedly")
+                return
+            magic, frame_id, seconds, milliseconds, width, height, frame_format, frame_size, metadata_size = STREAM_HEADER.unpack(header_bytes)
+            if magic != STREAM_MAGIC:
+                raise RuntimeError(f"Invalid libuvc stream magic: {magic!r}")
+            if frame_size > 100 * 1024 * 1024 or metadata_size > 10 * 1024 * 1024:
+                raise RuntimeError("Invalid libuvc stream record size")
+            frame_data = _read_exact(process.stdout, frame_size)
+            metadata = _read_exact(process.stdout, metadata_size)
+            if frame_data is None or metadata is None:
+                return
+            item = (frame_id, seconds + milliseconds / 1000.0, width, height, frame_format, frame_data, metadata)
+            try:
+                frames.put(item, timeout=0.01)
+            except queue.Full:
+                pass
+    except Exception as error:
+        try:
+            frames.put_nowait(error)
+        except queue.Full:
+            pass
+
+
+def record_frames_from_usb(camera_handler: CameraHandler, camera_index: CameraIndex, stream_enabled: bool=False, recording_enabled: bool=False, external_trigger_enabled: bool=False):
+    serial_idx = camera_handler.urls[camera_index]
+    width, height = (640, 480) if camera_index == CameraIndex.SC else (240, 240)
+    command = [LIBUVC_BINARY, "-name", str(serial_idx), "-resx", str(width), "-resy", str(height), "-fps", "60", "-stream"]
+    if external_trigger_enabled:
+        command.append("-trigger")
+        command.append("true")
+    else:
+        command.append("-trigger")
+        command.append("false")
+        
+    if recording_enabled:
+        command.append("-out")
+        command.append(str(camera_handler.capture_folder_manager.get_save_path() / camera_index.value))
+        
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    except OSError as error:
+        print(f"Failed to start libuvc camera {serial_idx}: {error}")
+        return
+
+    frame_queue = queue.Queue(maxsize=1)
+    reader_stop = threading.Event()
+    reader = threading.Thread(target=_read_libuvc_stream, args=(process, frame_queue, reader_stop), daemon=True)
+    error_reader = threading.Thread(
+        target=_print_process_errors,
+        args=(process, reader_stop, serial_idx),
+        daemon=True,
+    )
+    reader.start()
+    error_reader.start()
+    fps_window_len = 10
+    fps_buffer = np.zeros(fps_window_len)
+    start_time = 0
+    frame_count = 0
+
+    try:
+        while not camera_handler.ev_request_terminate.is_set():
+            try:
+                frame_data = frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                continue
+            if isinstance(frame_data, Exception):
+                print(f"Failed to read frame from USB camera {serial_idx}: {frame_data}")
+                break
+
+            frame_id, hardware_timestamp, frame_width, frame_height, frame_format, raw_frame, metadata = frame_data
+            if stream_enabled or recording_enabled:
+                raw_array = np.frombuffer(raw_frame, dtype=np.uint8)
+                if frame_format == FRAME_FORMAT_YUYV:
+                    frame = cv2.cvtColor(raw_array.reshape((frame_height, frame_width, 2)), cv2.COLOR_YUV2BGR_YUYV)
+                elif frame_format == FRAME_FORMAT_MJPEG:
+                    jpeg = _complete_jpeg(raw_frame)
+                    if jpeg is None:
+                        continue
+                    frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                else:
+                    print(f"Skipping unsupported frame format {frame_format} from camera {serial_idx}")
+                    continue
+                if frame is None:
+                    print(f"Could not decode JPEG frame {frame_id} from camera {serial_idx}")
+                    continue
+                frame_cv = frame
+            else:
+                frame_cv = None
+
+            now = time.perf_counter()
+            if start_time == 0:
+                start_time = now
+            window_len = min(frame_count + 1, fps_window_len)
+            fps_buffer[frame_count % window_len] = now
+            fps = 0.0 if frame_count <= 1 else (window_len - 1) / (fps_buffer[frame_count % window_len] - fps_buffer[(frame_count + 1) % window_len])
+            x_timestamp = now - start_time
+            transfer = CaptureTransferBufferFrame(
+                frame_raw=frame_cv.copy() if stream_enabled else None,
+                x_timestamp=x_timestamp,
+                x_timestamp_from_start=x_timestamp,
+                x_timestamp_hw=hardware_timestamp,
+                frame_idx=frame_id,
+                fps=fps,
+            )
+            try:
+                camera_handler.stream_qs[camera_index].put_nowait(transfer)
+            except queue.Full:
+                pass
+            frame_count += 1
+    finally:
+        reader_stop.set()
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        reader.join(timeout=2)
+
+    if process.returncode not in (0, -15, -9) and not camera_handler.ev_request_terminate.is_set():
+        print(f"libuvc camera {serial_idx} exited with status {process.returncode}")
+
+    if camera_handler.debug:
+        print(f"USB camera {serial_idx} recording finished. Captured {frame_count} frames.")
+
 
 if __name__ == "__main__":
     # Example usage

@@ -41,7 +41,7 @@ class UIFrameCameraSettings:
     eye_cam: bool
 
 # Helper constants
-_DEFAULT_CAMERA_URLS = ["vivarefsys2ro", "vivarefsys2ri", "vivarefsys2lo", "vivarefsys2li", "USB 2.0 Camera"]  # IP camera URLs and USB camera index (Find camera index via ffmpeg -f avfoundation -list_devices true -i "")
+_DEFAULT_CAMERA_URLS = ["vivarefsys2ro", "vivarefsys2ri", "vivarefsys2li", "vivarefsys2lo", "USB 2.0 Camera"]  # IP camera URLs and USB camera index (Find camera index via ffmpeg -f avfoundation -list_devices true -i "")
 _DEFAULT_CAMERA_TYPES = [CameraType.USB, CameraType.USB, CameraType.USB, CameraType.USB, CameraType.USB]
 DEFAULT_CAMERA_SETTINGS: dict[CameraIndex, UIFrameCameraSettings] = {
     CameraIndex.RO: UIFrameCameraSettings(
@@ -56,16 +56,16 @@ DEFAULT_CAMERA_SETTINGS: dict[CameraIndex, UIFrameCameraSettings] = {
         grid_placement=[1, 0],
         eye_cam=True
     ),
-    CameraIndex.LO: UIFrameCameraSettings(
-        url=_DEFAULT_CAMERA_URLS[3],
-        type=_DEFAULT_CAMERA_TYPES[3],
-        grid_placement=[0, 1],
-        eye_cam=True
-    ),
     CameraIndex.LI: UIFrameCameraSettings(
         url=_DEFAULT_CAMERA_URLS[2],
         type=_DEFAULT_CAMERA_TYPES[2],
         grid_placement=[1, 1],
+        eye_cam=True
+    ),
+    CameraIndex.LO: UIFrameCameraSettings(
+        url=_DEFAULT_CAMERA_URLS[3],
+        type=_DEFAULT_CAMERA_TYPES[3],
+        grid_placement=[0, 1],
         eye_cam=True
     ),
     CameraIndex.SC: UIFrameCameraSettings(
@@ -146,7 +146,7 @@ class UITabCapture:
                 self.frame_info = ttk.Frame(self.frame)
                 self.frame_info.grid(column=1, row=1, sticky=(N, W))
 
-                ttk.Label(self.frame_info, text=f"Cam IP").grid(column=1, row=2, sticky=(N,W))
+                ttk.Label(self.frame_info, text=f"Cam Name").grid(column=1, row=2, sticky=(N,W))
                 self.sv_ip = StringVar()
                 self.sv_ip.set(ui_frame_camera_settings.url)
                 ttk.Entry(self.frame_info, textvariable=self.sv_ip, width=15).grid(column=2, row=2, sticky=(N,W))
