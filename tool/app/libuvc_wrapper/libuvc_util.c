@@ -8,13 +8,11 @@
 #include <string.h>
 #ifdef _WIN32
 #include <direct.h>
-#include <fcntl.h>
-#include <io.h>
 #else
 #include <sys/stat.h>
 #endif
 
-//cmake --build /Users/ge83nax/Desktop/code/cpp_opencv/libuvc/build --target libuvc_util
+//cmake --build ./build --target libuvc_util
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -274,9 +272,6 @@ int main(int argc, char **argv) {
   int fps = 0;
   int exit_code = 1;
 
-#ifdef _WIN32
-  _setmode(_fileno(stdout), _O_BINARY);
-#endif
 
   if (!parse_options(argc, argv, &options)) {
     usage(argv[0]);
@@ -328,8 +323,13 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
   camera_terminal = uvc_get_camera_terminal(device_handle);
+  // print bmcontrols to debug log for troubleshooting
+  if (options.debug && camera_terminal) {
+    fprintf(stderr, "[debug] camera terminal controls: 0x%016llx\n", (unsigned long long)camera_terminal->bmControls);
+  }
+  static const uint8_t UVC_BMCONTROLS_CT_FOCUS_AUTO_CONTROL_BIT = 5;  // Bit position from end for UVC_CT_FOCUS_AUTO_CONTROL in bmControls, CT D18 according to UVC 1.5 spec 
   if (options.trigger_specified && camera_terminal &&
-      (camera_terminal->bmControls & (1ULL << (UVC_CT_FOCUS_AUTO_CONTROL - 1)))) {
+      (camera_terminal->bmControls & (1ULL << (UVC_BMCONTROLS_CT_FOCUS_AUTO_CONTROL_BIT)))) {
     debug_log(&options, "enabling autofocus/trigger control");
     result = uvc_set_focus_auto(device_handle, options.trigger);
     if (result < 0) {
